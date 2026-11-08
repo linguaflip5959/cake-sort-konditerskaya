@@ -2,7 +2,12 @@
 <html lang="ru">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#161009" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="format-detection" content="telephone=no" />
     <title>Cake Sort — Кондитерская</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -15,6 +20,7 @@
         margin: 0; width: 100%; height: 100%; overflow: hidden;
         background: #161009; font-family: 'Nunito', system-ui, sans-serif;
         touch-action: none; user-select: none; -webkit-user-select: none;
+        overscroll-behavior: none; -webkit-tap-highlight-color: transparent;
       }
       #app { width: 100%; height: 100%; }
       .vignette {
@@ -26,18 +32,50 @@
         border: 1px solid rgba(212, 175, 55, 0.38); border-radius: 16px; color: #f0e2c4;
         backdrop-filter: blur(8px); box-shadow: 0 10px 30px rgba(0,0,0,0.45);
       }
-      #hud { top: 14px; left: 14px; padding: 10px 18px; display: flex; flex-direction: column; gap: 2px; }
+      #hud {
+        top: max(14px, env(safe-area-inset-top, 0px));
+        left: max(14px, env(safe-area-inset-left, 0px));
+        padding: 10px 18px; display: flex; flex-direction: column; gap: 2px;
+      }
       #level { font-family: 'Playfair Display', Georgia, serif; font-weight: 700; font-size: 21px; color: #e8c96a; }
       #moves { font-size: 13.5px; font-weight: 700; color: #cdbb96; }
       #coins { font-size: 13.5px; font-weight: 700; color: #ffe9a8; }
       #coins b { color: #ffdf8e; }
-      #dotsWrap { top: 14px; left: 50%; transform: translateX(-50%); padding: 12px 18px; display: flex; gap: 8px; }
-      .dot { width: 15px; height: 15px; border-radius: 50%; border: 1.5px solid rgba(212,175,55,0.6); transition: all 0.25s ease; }
-      .dot.on {
-        background: radial-gradient(circle at 35% 30%, #ffe9a8, #d4af37); border-color: #e8c96a;
-        box-shadow: 0 0 10px rgba(232, 201, 106, 0.65);
+      /* Прогрессбар до нового торта — над столом (ТЗ итерации 3) */
+      #goalWrap {
+        top: max(14px, env(safe-area-inset-top, 0px)); left: 50%; transform: translateX(-50%);
+        padding: 9px 14px; display: flex; align-items: center; gap: 12px;
       }
-      #tools { top: 14px; right: 14px; padding: 8px; display: flex; flex-direction: column; gap: 7px; }
+      #goalBody { display: flex; flex-direction: column; gap: 4px; }
+      #goalRow { display: flex; justify-content: space-between; gap: 16px; font-size: 11.5px; font-weight: 800; }
+      #goalLabel { color: #cdbb96; letter-spacing: 0.04em; text-transform: uppercase; }
+      #goalText { color: #ffe9a8; font-variant-numeric: tabular-nums; }
+      #goalBar {
+        width: min(34vw, 280px); height: 12px; border-radius: 999px;
+        background: rgba(10, 7, 4, 0.85); border: 1px solid rgba(212,175,55,0.5);
+        overflow: hidden; box-shadow: inset 0 2px 4px rgba(0,0,0,0.55);
+      }
+      #goalFill {
+        height: 100%; width: 0%; border-radius: 999px;
+        background: linear-gradient(90deg, #b98a2c, #f0d387 60%, #ffe9a8);
+        box-shadow: 0 0 10px rgba(240, 211, 135, 0.55);
+        transition: width 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+      }
+      /* иконка нового торта — заметно крупнее полосы */
+      #goalIcon {
+        width: 50px; height: 50px; border-radius: 50%; flex: 0 0 auto;
+        background: radial-gradient(circle at 50% 38%, rgba(255,236,180,0.16), rgba(10,7,4,0.9));
+        border: 1.5px solid rgba(232, 201, 106, 0.75);
+        box-shadow: 0 0 14px rgba(232, 201, 106, 0.28), inset 0 0 10px rgba(0,0,0,0.5);
+        display: flex; align-items: center; justify-content: center;
+        filter: drop-shadow(0 3px 5px rgba(0,0,0,0.5));
+      }
+      #goalIcon svg { width: 42px; height: 42px; display: block; }
+      #tools {
+        top: max(14px, env(safe-area-inset-top, 0px));
+        right: max(14px, env(safe-area-inset-right, 0px));
+        padding: 8px; display: flex; flex-direction: column; gap: 7px;
+      }
       #tools button {
         min-height: 44px; padding: 9px 16px; border: 1px solid rgba(255, 236, 180, 0.75); border-radius: 13px;
         font-family: 'Nunito', sans-serif; font-size: 13.5px; font-weight: 800; line-height: 1.18;
@@ -61,9 +99,47 @@
       }
       #overlay.show { display: flex; }
       #card {
+        position: relative; overflow: hidden;
         background: linear-gradient(160deg, #241a0e, #171008); border: 1.5px solid rgba(212, 175, 55, 0.65);
-        border-radius: 24px; padding: 34px 40px; text-align: center; max-width: 340px; color: #f0e2c4;
+        border-radius: 24px; padding: 30px 40px 34px; text-align: center; max-width: 380px; color: #f0e2c4;
         box-shadow: 0 24px 60px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,235,170,0.18);
+        animation: card-pop 0.5s cubic-bezier(0.18, 1.4, 0.4, 1) both;
+      }
+      #card.gold {
+        border-color: rgba(255, 226, 148, 0.95);
+        box-shadow: 0 0 46px rgba(240, 211, 135, 0.4), 0 24px 60px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,235,170,0.25);
+      }
+      /* блик, пробегающий по карточке нового торта */
+      #card::after {
+        content: ''; position: absolute; inset: -60% auto; width: 45%; transform: translateX(-140%) rotate(18deg);
+        background: linear-gradient(90deg, transparent, rgba(255, 240, 200, 0.16), transparent);
+        animation: card-shine 2.6s 0.35s ease-in-out infinite;
+      }
+      @keyframes card-pop {
+        from { transform: scale(0.55) translateY(28px); opacity: 0; }
+        to { transform: scale(1) translateY(0); opacity: 1; }
+      }
+      @keyframes card-shine {
+        0% { left: -50%; } 55%, 100% { left: 130%; }
+      }
+      #ovCake {
+        width: 150px; height: 150px; margin: 0 auto 6px;
+        border-radius: 50%;
+        background: radial-gradient(circle at 50% 40%, rgba(255,236,180,0.2), rgba(10,7,4,0.92) 72%);
+        border: 2px solid rgba(232, 201, 106, 0.8);
+        box-shadow: 0 0 34px rgba(232, 201, 106, 0.35), inset 0 0 22px rgba(0,0,0,0.55);
+        display: flex; align-items: center; justify-content: center;
+        animation: cake-glow 2.2s ease-in-out infinite;
+      }
+      #ovCake svg { width: 126px; height: 126px; display: block; filter: drop-shadow(0 6px 10px rgba(0,0,0,0.55)); }
+      @keyframes cake-glow {
+        0%, 100% { box-shadow: 0 0 26px rgba(232,201,106,0.28), inset 0 0 22px rgba(0,0,0,0.55); }
+        50% { box-shadow: 0 0 48px rgba(240,211,135,0.55), inset 0 0 22px rgba(0,0,0,0.55); }
+      }
+      #ovBadge {
+        display: inline-block; margin-bottom: 6px; padding: 4px 14px; border-radius: 999px;
+        border: 1px solid rgba(232,201,106,0.6); background: rgba(212,175,55,0.12);
+        color: #ffe9a8; font-size: 11.5px; font-weight: 800; letter-spacing: 0.09em; text-transform: uppercase;
       }
       #ovTitle { font-family: 'Playfair Display', Georgia, serif; font-size: 30px; margin: 0 0 10px; color: #e8c96a; font-weight: 800; }
       #ovText { margin: 0 0 22px; font-size: 15.5px; line-height: 1.5; color: #d8c9a5; white-space: pre-line; font-weight: 600; }
@@ -72,14 +148,56 @@
         background: linear-gradient(145deg, #f0d387, #c39a35); color: #241a08; cursor: pointer; font-family: 'Nunito', sans-serif;
         box-shadow: 0 4px 0 rgba(120, 88, 20, 0.55), inset 0 1px 2px rgba(255,255,255,0.5);
       }
+      /* Всплывающие очки за торты */
+      #floaters { position: fixed; inset: 0; pointer-events: none; z-index: 15; }
+      .floater {
+        position: absolute; transform: translate(-50%, -50%);
+        font-family: 'Nunito', sans-serif; font-weight: 800; font-size: 21px; color: #ffe9a8;
+        text-shadow: 0 2px 8px rgba(0,0,0,0.75), 0 0 18px rgba(240,211,135,0.55);
+        animation: float-up 1.15s cubic-bezier(0.2, 0.7, 0.3, 1) forwards; text-align: center; line-height: 1.1;
+      }
+      .floater .combo { display: block; font-size: 14px; color: #ffd97a; letter-spacing: 0.05em; }
+      @keyframes float-up {
+        0% { opacity: 0; margin-top: 10px; scale: 0.6; }
+        18% { opacity: 1; scale: 1.12; }
+        30% { scale: 1; }
+        75% { opacity: 1; }
+        100% { opacity: 0; margin-top: -74px; scale: 0.95; }
+      }
       @media (max-width: 640px) {
-        #level { font-size: 18px; }
-        #dotsWrap { display: none; }
-        #hud { padding: 8px 14px; }
-        #tools { top: 10px; right: 10px; padding: 6px; gap: 6px; display: grid; grid-template-columns: 1fr 1fr; width: 196px; }
-        #tools button { font-size: 12px; padding: 7px 8px; max-width: none; width: 100%; }
+        #level { font-size: 17px; }
+        #moves, #coins { font-size: 12px; }
+        /* узкий экран: цель — отдельной строкой под HUD и кнопками,
+           чтобы не перекрываться с панелью инструментов */
+        #goalWrap {
+          padding: 7px 10px; gap: 9px;
+          top: max(94px, calc(env(safe-area-inset-top, 0px) + 88px));
+          left: 50%; transform: translateX(-50%);
+        }
+        #goalBar { width: min(48vw, 210px); height: 11px; }
+        #goalIcon { width: 44px; height: 44px; }
+        #goalIcon svg { width: 37px; height: 37px; }
+        #goalRow { font-size: 10.5px; }
+        #hud { padding: 7px 12px; gap: 1px; border-radius: 13px; }
+        #tools {
+          top: max(10px, env(safe-area-inset-top, 0px));
+          right: max(10px, env(safe-area-inset-right, 0px));
+          padding: 6px; gap: 6px; display: grid;
+          grid-template-columns: 1fr 1fr; width: 188px;
+        }
+        #tools button { font-size: 12px; padding: 8px 6px; min-height: 46px; max-width: none; width: 100%; border-radius: 11px; }
         #tools #rotate { grid-column: 1 / -1; }
-        #toast { top: 158px; }
+        #toast { top: 156px; font-size: 13.5px; padding: 10px 16px; }
+        #card { padding: 22px 22px 26px; max-width: 86vw; }
+        #ovCake { width: 122px; height: 122px; }
+        #ovCake svg { width: 102px; height: 102px; }
+        #ovTitle { font-size: 24px; }
+        #ovBtn { width: 100%; }
+        .floater { font-size: 17px; }
+      }
+      @media (max-width: 400px) {
+        #tools { width: 168px; }
+        #tools button { font-size: 11.5px; }
       }
     </style>
   </head>
@@ -87,15 +205,24 @@
     <div id="app"></div>
     <div class="vignette"></div>
     <div id="hud" class="panel"><span id="level">Уровень 1</span><span id="moves">Ходов: 0</span><span id="coins">Монеты: <b id="coinsNum">30</b></span></div>
-    <div id="dotsWrap" class="panel"><span id="dots" style="display:flex;gap:8px"></span></div>
+    <div id="goalWrap" class="panel">
+      <div id="goalBody">
+        <div id="goalRow"><span id="goalLabel">До нового торта</span><span id="goalText">0 / 250</span></div>
+        <div id="goalBar"><div id="goalFill"></div></div>
+      </div>
+      <div id="goalIcon" title="Следующий торт"></div>
+    </div>
     <div id="tools" class="panel">
       <button id="hint" title="Подсказка за 15 монет">Подсказка −15</button>
       <button id="restart" title="Начать уровень заново">Заново</button>
       <button id="rotate" hidden title="Повернуть двойную тарелку (R)">Повернуть двойную тарелку</button>
     </div>
+    <div id="floaters"></div>
     <div id="toast"></div>
     <div id="overlay">
       <div id="card">
+        <div id="ovCake"></div>
+        <div id="ovBadge"></div>
         <div id="ovTitle"></div>
         <div id="ovText"></div>
         <button id="ovBtn"></button>

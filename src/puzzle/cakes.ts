@@ -6,6 +6,7 @@
 
 import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
+import { FLAVOR_COUNT } from './game/types';
 
 /* ------------------------------------------------------------------ */
 /* Типы тортиков                                                       */
@@ -32,7 +33,22 @@ export const CAKE_TYPES: readonly CakeType[] = [
   { name: 'Карамельный',   main: 0xc98a3d, cream: 0xf6e3c2, topping: 0xa96b22 },
   { name: 'Ванильный',     main: 0xf0e2c4, cream: 0xfffaf0, topping: 0xd4af37 },
   { name: 'Тирамису',      main: 0x6b4a35, cream: 0xf0e4d0, topping: 0x3c2a1e },
+  // итерация 3: шесть новых тортов — открываются с уровнями 11–15
+  { name: 'Мокко',         main: 0x5d4037, cream: 0xe8d5b5, topping: 0x6f4e37 },
+  { name: 'Вишнёвый',      main: 0x5c0f1e, cream: 0xf9e0d9, topping: 0xb3232f },
+  { name: 'Кокосовый',     main: 0xf5efe0, cream: 0xfdf9ef, topping: 0x8a5a2b },
+  { name: 'Апельсиновый',  main: 0xef8f3a, cream: 0xffe8c8, topping: 0xd96a10 },
+  { name: 'Мятный',        main: 0x5fbfae, cream: 0xeafff5, topping: 0x2e8b74 },
+  { name: 'Лавандовый',    main: 0x9d7bc0, cream: 0xf0e8fa, topping: 0x6a4a94 },
 ] as const;
+
+/** Синхронизация с игровым слоем: вкусов ровно FLAVOR_COUNT (types.ts) */
+export function assertFlavorCount(): void {
+  if (CAKE_TYPES.length !== FLAVOR_COUNT) {
+    throw new Error(`CAKE_TYPES: ${CAKE_TYPES.length} видов, ожидается ${FLAVOR_COUNT}`);
+  }
+}
+export { FLAVOR_COUNT };
 
 /* ------------------------------------------------------------------ */
 /* Геометрия кусочка-сектора (60°)                                     */

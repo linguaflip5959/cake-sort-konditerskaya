@@ -1,22 +1,35 @@
 /**
  * Cake Sort — «Кондитерская»
- * Слой 2: детерминированный генератор уровней (ТЗ итерации 2, п. 2).
+ * Слой 2: генератор уровней (итерация 3 — очки и бесконечная очередь).
  *
- * Уровни 4+ собираются «обратной сборкой»: берётся нужное число полных
- * тортов, каждый разрезается на порции по 1–5 кусочков (в сумме 6), порции
- * раздаются по тарелкам — часть тарелок остаётся на поле, часть уходит
- * в очередь, из части формируются двойные тарелки. Так число кусочков
- * каждого вкуса кратно шести, а уровень с высокой вероятностью решаем.
+ * Уровня больше не «рассчитываются вручную» и не проверяются солвером:
+ * собираем ОЧКИ, а не N тортов, поэтому уровень не может быть «нерешаемым»
+ * в принципе — материал бесконечен. Поражение только одно: стол 3×3
+ * забился до отказа. Сложность управляется конфигом: цель в очках, число
+ * доступных вкусов, состав тарелок, двойные тарелки.
  *
- * Генерация полностью детерминирована: seed = f(номер уровня, попытка),
- * никаких Math.random. Каждый уровень обязан проходить солвер и порог
- * «случайной игры»; не прошедший проверку сид отбрасывается (ТЗ п. 2.1).
+ * Поток выдачи детерминирован: элемент с номером i вычисляется из
+ * (seed уровня, i) без состояния — один и тот же уровень всегда раздаёт
+ * одни и те же тарелки в одном порядке. Двойные тарелки встречаются не
+ * чаще, чем одна на 7 элементов: в видимой выдаче (5) двойная всегда
+ * максимум одна, а её половинки полноразмерные, как обычные тарелки.
+ *
+ * Прогрессия тортов: уровень n играет вкусами 0..min(FLAVOR_COUNT, n).
+ * Прохождение уровня открывает следующий торт (карточка победы). Когда
+ * открыты все — начинается «золотая серия»: карточка с золотым тортом.
  */
 
-import { FIXED_LEVELS } from './fixed';
-import { applyTrayMove, createInitialState, evalEnd, legalMoves, resolveTurn } from './rules';
-import { solve } from './solver';
-import { CAP, trayFlavors, type Flavor, type LevelData, type TrayItem } from './types';
+import {
+  CAP,
+  FLAVOR_COUNT,
+  TRAY_BUFFER,
+  WINDOW,
+  type Flavor,
+  type InitialPlate,
+  type LevelData,
+  type TrayItem,
+  type TrayStream,
+} from './types';
 
 /* ------------------------------------------------------------------ */
 /* ГСЧ и утилиты                                                       */
@@ -32,330 +45,234 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-function shuffle<T>(rng: () => number, arr: T[]): T[] {
-  for (let i = arr.length - 1; i > 0; i--) {
+/** Детерминированный хеш пары чисел */
+function hash2(a: number, b: number): number {
+  let h = (Math.imul(a ^ 0x9e3779b9, 2654435761) ^ Math.imul(b ^ 0x85ebca6b, 2246822519)) >>> 0;
+  h ^= h >>> 13;
+  h = Math.imul(h, 3266489917) >>> 0;
+  h ^= h >>> 16;
+  return h >>> 0;
+}
+
+function pick<T>(rng: () => number, arr: readonly T[]): T {
+  return arr[Math.floor(rng() * arr.length)];
+}
+
+/* ------------------------------------------------------------------ */
+/* Конфиг уровня                                                       */
+/* ------------------------------------------------------------------ */
+
+export interface LevelConfig {
+  /** цель уровня в очках */
+  target: number;
+  /** вкусы уровня (пул выдачи): не больше MAX_POOL, всегда включает новинку */
+  flavors: Flavor[];
+  /** всего открыто вкусов (для карточек/коллекции) */
+  unlockedCount: number;
+  /** торт, открываемый за прохождение (карточка победы) */
+  unlockFlavor: number;
+  /** золотая серия: все вкусы открыты, карточка — золотой торт */
+  golden: boolean;
+  /** начальных тарелок на столе */
+  initialCount: number;
+  /** двойные тарелки в потоке */
+  doubles: boolean;
+  /** редкие «почти торты» (5 кусочков одного вкуса) */
+  heavy: boolean;
+  /** сид потока */
+  seed: number;
+}
+
+/** Максимум вкусов в пуле уровня: с большим числом вкусов слияния
+ *  становятся редкими и стол гарантированно забивается. Сложность
+ *  растёт за счёт цели и состава тарелок, а не числа вкусов. */
+export const MAX_POOL = 6;
+
+/** Цель уровня в очках: мягкий рост с насыщением */
+export function targetFor(n: number): number {
+  return Math.min(1200, 250 + 60 * (n - 1));
+}
+
+/** Конфиг уровня по 1-номеру n */
+export function levelConfig(n: number): LevelConfig {
+  const N = Math.max(1, Math.floor(n));
+  // вкусы 0..unlocked-1 доступны в игре; уровень n открывает вкус n+1
+  const unlocked = Math.min(FLAVOR_COUNT, N + 1);
+  const golden = N + 1 >= FLAVOR_COUNT; // открывать больше нечего
+  const unlockFlavor = golden ? (Math.imul(N, 7) + 3) % FLAVOR_COUNT : N + 1;
+  // новинка уровня: только что открытый прошлым уровнем вкус; в золотой
+  // серии — тот самый торт, что показан на карточке (в золотом исполнении)
+  const featured = golden ? unlockFlavor : unlocked - 1;
+
+  // пул: маленький в начале, максимум MAX_POOL; новинка — всегда в игре
+  const poolSize = Math.min(MAX_POOL, unlocked);
+  const rng = mulberry32(hash2(N, 0x2545f491));
+  const candidates: Flavor[] = [];
+  for (let i = 0; i < unlocked; i++) if (i !== featured) candidates.push(i);
+  for (let i = candidates.length - 1; i > 0; i--) {
     const j = Math.floor(rng() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
+    [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
   }
-  return arr;
+  const flavors: Flavor[] = [featured, ...candidates.slice(0, poolSize - 1)];
+  flavors.sort((a, b) => a - b);
+
+  return {
+    target: targetFor(N),
+    flavors,
+    unlockedCount: unlocked,
+    unlockFlavor,
+    golden,
+    initialCount: N <= 2 ? 2 : 3,
+    doubles: N >= 3,
+    heavy: N >= 4,
+    seed: hash2(N, 0x51ed270b),
+  };
 }
 
 /* ------------------------------------------------------------------ */
-/* Кривая сложности (ТЗ п. 2.3, стартовая — уточняется тестами)         */
+/* Состав тарелок                                                      */
 /* ------------------------------------------------------------------ */
 
-interface CurveParams {
-  rows: number;
-  cols: number;
-  /** сколько разных вкусов выбрать */
-  flavors: number;
-  /** сколько полных тортов */
-  cakes: number;
-  /** элементов в очереди (обычные + двойные) */
-  queue: number;
-  /** двойных тарелок */
-  doubles: number;
-  /** начальных тарелок на поле */
-  initial: number;
-}
+/**
+ * Одна тарелка потока: обычно 2–3 вкуса по 1–2 кусочка (4-й вкус — редкая
+ * роскошь на поздних уровнях), иногда чистая тарелка на 1–2 кусочка и
+ * совсем редко — «почти торт» из 5 одинаковых (cfg.heavy).
+ */
+function plateSlices(rng: () => number, cfg: { flavors: Flavor[]; heavy: boolean }, maxSlices: number): Flavor[] {
+  const F = cfg.flavors;
 
-function curve(n: number, rng: () => number): CurveParams {
-  const ri = (k: number): number => Math.floor(rng() * k);
-  if (n <= 6) {
-    return { rows: 3, cols: 3, flavors: 3 + ri(2), cakes: 3 + ri(2), queue: 5 + ri(2), doubles: ri(2), initial: 2 };
+  // «почти торт» — редкий подарок: 5 кусочков одного вкуса
+  if (cfg.heavy && rng() < 0.025 && maxSlices >= 5) {
+    return new Array(5).fill(pick(rng, F));
   }
-  if (n <= 10) {
-    return { rows: 3, cols: 3, flavors: 4 + ri(2), cakes: 4 + ri(2), queue: 6 + ri(3), doubles: 1, initial: 2 + ri(2) };
-  }
-  if (n <= 20) {
-    return { rows: 3, cols: 4, flavors: 5 + ri(2), cakes: 5 + ri(2), queue: 7 + ri(3), doubles: 1 + ri(2), initial: 2 + ri(2) };
-  }
-  return { rows: 3, cols: 4, flavors: 6 + ri(2), cakes: 6 + ri(2), queue: 8 + ri(3), doubles: 2, initial: 3 };
-}
 
-/* ------------------------------------------------------------------ */
-/* Вкусы                                                               */
-/* ------------------------------------------------------------------ */
+  // чистая тарелка: 1–2 кусочка одного вкуса — топливо для слияний
+  if (rng() < 0.09) {
+    const f = pick(rng, F);
+    return new Array(1 + Math.floor(rng() * 2)).fill(f);
+  }
 
-function pickFlavors(rng: () => number, count: number): Flavor[] {
-  const pool: Flavor[] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+  // обычная тарелка: 2 вкуса, на просторных уровнях — 3, изредка 4
+  const wide = F.length >= 8;
+  let distinct = 2;
+  const r = rng();
+  if (r < (wide ? 0.34 : 0.16)) distinct = 3;
+  if (wide && r > 0.93) distinct = 4;
+  distinct = Math.min(distinct, Math.max(2, maxSlices - 1), F.length);
+
+  const chosen: Flavor[] = [];
+  while (chosen.length < distinct) {
+    const f = pick(rng, F);
+    if (!chosen.includes(f)) chosen.push(f);
+  }
+
   const out: Flavor[] = [];
-  for (let i = 0; i < count; i++) out.push(pool.splice(Math.floor(rng() * pool.length), 1)[0]);
+  for (const f of chosen) {
+    // по 1–2 кусочка; тройка — редкость (не «полторта одним вкусом»)
+    let k = rng() < 0.62 ? 1 : 2;
+    if (k === 2 && rng() < 0.12) k = 3;
+    while (k > 0 && out.length + k > maxSlices) k--;
+    if (k <= 0) continue;
+    for (let i = 0; i < k; i++) out.push(f);
+  }
+  if (out.length === 0) out.push(pick(rng, F));
   return out;
 }
 
-function flavorSetOf(level: LevelData): Set<Flavor> {
-  const s = new Set<Flavor>();
-  for (const p of level.initial) for (const f of p.slices) s.add(f);
-  for (const it of level.tray) for (const f of trayFlavors(it)) s.add(f);
-  return s;
-}
-
-function sameSet(a: Set<Flavor>, b: Set<Flavor>): boolean {
-  if (a.size !== b.size) return false;
-  for (const f of a) if (!b.has(f)) return false;
-  return true;
-}
-
-const flavorCache = new Map<number, Set<Flavor>>();
-
-/**
- * Набор вкусов уровня: детерминирован только номером уровня и не зависит
- * от того, какая попытка сборки оказалась успешной. Благодаря этому
- * generateLevel(n) не тянет за собой полную генерацию всех предыдущих
- * уровней — рекурсия идёт только по лёгким наборам вкусов.
- */
-export function flavorSetFor(n: number): Set<Flavor> {
-  const cached = flavorCache.get(n);
-  if (cached) return cached;
-  const rng = mulberry32((Math.imul(n, 2246822519) ^ 0x27d4eb2f) >>> 0);
-  const params = curve(n, rng);
-  const distinct = Math.max(3, Math.min(params.flavors, params.cakes, 10));
-  const set = new Set<Flavor>(pickFlavors(rng, distinct));
-  const prev = n - 1 <= FIXED_LEVELS.length ? flavorSetOf(FIXED_LEVELS[n - 2]) : flavorSetFor(n - 1);
-  if (sameSet(set, prev)) {
-    const unused = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].filter((f) => !set.has(f));
-    if (unused.length > 0) {
-      const arr = [...set];
-      const idx = Math.floor(rng() * arr.length);
-      arr[idx] = unused[Math.floor(rng() * unused.length)];
-      set.clear();
-      for (const f of arr) set.add(f);
-    }
+/** Элемент потока с номером i: детерминирован (seed, i) */
+function streamItem(seed: number, i: number, cfg: { flavors: Flavor[]; doubles: boolean; heavy: boolean }): TrayItem {
+  const rng = mulberry32(hash2(seed, i));
+  // двойные: с 6-го элемента, не чаще одной на 7 позиций
+  if (cfg.doubles && i >= 6 && i % 7 === 3 && rng() < 0.8) {
+    return {
+      kind: 'double',
+      a: plateSlices(rng, cfg, 4),
+      b: plateSlices(rng, cfg, 4),
+    };
   }
-  flavorCache.set(n, set);
-  return set;
+  return { kind: 'single', slices: plateSlices(rng, cfg, 5) };
 }
 
 /* ------------------------------------------------------------------ */
-/* Обратная сборка                                                     */
+/* Сборка уровня                                                       */
 /* ------------------------------------------------------------------ */
 
-/** Разрезать торт из 6 кусочков на parts порций по 1..5 кусочков */
-function cutCake(rng: () => number, parts: number): number[] {
-  const sizes = new Array<number>(parts).fill(1);
-  let rem = CAP - parts;
-  while (rem > 0) {
-    const i = Math.floor(rng() * parts);
-    if (sizes[i] < 5) {
-      sizes[i]++;
-      rem--;
-    }
-  }
-  return sizes;
-}
-
-/** Порция одного вкуса */
-interface Portion {
-  f: Flavor;
-  k: number;
-}
+/** Поле уровня: всегда 3×3 (ТЗ итерации 3) */
+export const LEVEL_ROWS = 3;
+export const LEVEL_COLS = 3;
 
 /**
- * Раздать порции по тарелкам: сначала по одной порции на тарелку,
- * затем остаток — в смешанные тарелки (2–3 вкуса). Возвращает null,
- * если порции не помещаются (попытка перегенерации).
+ * Уровень по 1-номеру: стол 3×3, начальные тарелки, первая выдача
+ * (WINDOW + TRAY_BUFFER элементов) и бесконечный поток с сидом.
  */
-function dealPlates(rng: () => number, portions: Portion[], plateCount: number, mixProb: number): Flavor[][] | null {
-  const plates: Flavor[][] = Array.from({ length: plateCount }, () => []);
-  const flavorsOf = (p: Flavor[]): Set<Flavor> => new Set(p);
-  const room = (p: Flavor[]): number => CAP - p.length;
-  const canTake = (p: Flavor[], f: Flavor): boolean => room(p) > 0 && (flavorsOf(p).size < 3 || p.includes(f));
+export function buildLevel(n: number): LevelData {
+  const cfg = levelConfig(n);
+  const rng = mulberry32(cfg.seed);
 
-  for (let i = 0; i < plateCount; i++) {
-    const por = portions[i];
-    for (let k = 0; k < por.k; k++) plates[i].push(por.f);
+  // начальные тарелки: 2–3 штуки в случайных разных ячейках
+  const cells = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+  for (let i = cells.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [cells[i], cells[j]] = [cells[j], cells[i]];
+  }
+  const initial: InitialPlate[] = [];
+  for (let k = 0; k < cfg.initialCount; k++) {
+    const cell = cells[k];
+    initial.push({
+      row: Math.floor(cell / LEVEL_COLS),
+      col: cell % LEVEL_COLS,
+      slices: plateSlices(rng, cfg, 5),
+    });
   }
 
-  for (let i = plateCount; i < portions.length; i++) {
-    const por = portions[i];
-    const mixedOk: number[] = [];
-    const anyOk: number[] = [];
-    for (let j = 0; j < plateCount; j++) {
-      if (room(plates[j]) < por.k) continue;
-      if (plates[j].length > 0 && canTake(plates[j], por.f)) mixedOk.push(j);
-      if (room(plates[j]) >= por.k) anyOk.push(j);
-    }
-    let target: number;
-    if (mixedOk.length > 0 && rng() < mixProb) {
-      target = mixedOk[Math.floor(rng() * mixedOk.length)];
-    } else if (anyOk.length > 0) {
-      target = anyOk[Math.floor(rng() * anyOk.length)];
-    } else {
-      return null;
-    }
-    for (let k = 0; k < por.k; k++) plates[target].push(por.f);
-  }
-  return plates;
-}
-
-/** Подпись элемента очереди: отсортированные кусочки (для сравнения «одинаковых») */
-function itemSignature(it: TrayItem): string {
-  return [...trayFlavors(it)].sort((x, y) => x - y).join('.');
-}
-
-/** Смешанная тарелка — два и более вкусов */
-function isMixed(it: TrayItem): boolean {
-  return new Set(trayFlavors(it)).size > 1;
-}
-
-/**
- * Порядок очереди (ТЗ п. 2.2.6): не ставить подряд одинаковые тарелки
- * и не копить смешанные тарелки в начале очереди.
- */
-function orderQueue(rng: () => number, items: TrayItem[]): TrayItem[] {
-  const pool = [...items];
-  const out: TrayItem[] = [];
-  let prevSig: string | null = null;
-  while (pool.length > 0) {
-    let cands = prevSig === null ? pool : pool.filter((it) => itemSignature(it) !== prevSig);
-    if (cands.length === 0) cands = pool;
-    if (out.length < 3) {
-      const pure = cands.filter((it) => !isMixed(it));
-      if (pure.length > 0 && rng() < 0.75) cands = pure;
-    }
-    const pick = cands[Math.floor(rng() * cands.length)];
-    out.push(pick);
-    pool.splice(pool.indexOf(pick), 1);
-    prevSig = itemSignature(pick);
-  }
-  return out;
-}
-
-/** Одна попытка сборки уровня; null — попробовать другой сид */
-function tryBuild(params: CurveParams, rng: () => number, set: Set<Flavor>): LevelData | null {
-  const { rows, cols } = params;
-
-  // Полные торты; выбранные вкусы распределяются равномерно
-  const setArr = [...set];
-  const cakeFlavors: Flavor[] = [];
-  for (let i = 0; i < params.cakes; i++) cakeFlavors.push(setArr[i % setArr.length]);
-  shuffle(rng, cakeFlavors);
-
-  // Порции: каждая шестёрка режется на части 1..5 (ТЗ п. 2.2.3)
-  const plateCount = params.initial + params.queue + params.doubles;
-  const targetPortions = plateCount + 2 + Math.floor(rng() * 3);
-  const perCake = Math.min(6, Math.max(2, Math.ceil(targetPortions / params.cakes)));
-  const portions: Portion[] = [];
-  for (const f of cakeFlavors) {
-    for (const k of cutCake(rng, perCake)) portions.push({ f, k });
-  }
-  if (portions.length < plateCount) return null;
-  shuffle(rng, portions);
-
-  const plates = dealPlates(rng, portions, plateCount, 0.55);
-  if (!plates) return null;
-  shuffle(rng, plates);
-
-  // Начальные тарелки на поле (ТЗ п. 2.2.4)
-  const initialIdx = new Set<number>();
-  while (initialIdx.size < params.initial) initialIdx.add(Math.floor(rng() * plateCount));
-  const initialCells = shuffle(rng, [...Array(rows * cols).keys()]).slice(0, params.initial);
-  const initial = [...initialIdx].map((idx, i) => ({
-    row: Math.floor(initialCells[i] / cols),
-    col: initialCells[i] % cols,
-    slices: plates[idx],
-  }));
-
-  // Очередь: двойные тарелки + обычные (ТЗ п. 2.2.5)
-  const rest: Flavor[][] = plates.filter((_, idx) => !initialIdx.has(idx));
+  const stream: TrayStream = {
+    seed: cfg.seed,
+    next: WINDOW + TRAY_BUFFER,
+    flavors: cfg.flavors,
+    doubles: cfg.doubles,
+    heavy: cfg.heavy,
+  };
   const tray: TrayItem[] = [];
-  for (let d = 0; d < params.doubles; d++) {
-    if (rest.length < 2) break;
-    const a = rest.shift();
-    const b = rest.shift();
-    if (!a || !b) break;
-    tray.push({ kind: 'double', a, b });
+  for (let i = 0; i < WINDOW + TRAY_BUFFER; i++) {
+    tray.push(streamItem(stream.seed, i, stream));
   }
-  for (const slices of rest) tray.push({ kind: 'single', slices });
 
-  return { rows, cols, initial, tray: orderQueue(rng, tray) };
+  return {
+    rows: LEVEL_ROWS,
+    cols: LEVEL_COLS,
+    initial,
+    tray,
+    target: cfg.target,
+    unlockFlavor: cfg.unlockFlavor,
+    stream,
+  };
+}
+
+/**
+ * Пополнить очередь из потока: в состоянии всегда WINDOW + TRAY_BUFFER
+ * элементов (5 видимых + запас). Вызывается движком после каждого хода.
+ */
+export function topUpTray(level: LevelData, state: { tray: TrayItem[] }): void {
+  const stream = level.stream;
+  if (!stream) return;
+  while (state.tray.length < WINDOW + TRAY_BUFFER) {
+    state.tray.push(streamItem(stream.seed, stream.next++, stream));
+  }
 }
 
 /* ------------------------------------------------------------------ */
-/* Случайная игра (порог качества, ТЗ п. 2.4)                          */
+/* Диагностика (тесты)                                                 */
 /* ------------------------------------------------------------------ */
 
-/**
- * Число побед при полностью случайной игре: на каждом ходу равновероятно
- * выбирается любой допустимый ход. Детерминирована сидом.
- */
-export function randomPlayWins(level: LevelData, games: number, seed: number): number {
-  const rng = mulberry32((seed >>> 0) || 1);
-  let wins = 0;
-  for (let g = 0; g < games; g++) {
-    const st = createInitialState(level);
-    for (let guard = 0; guard < 400; guard++) {
-      const end = evalEnd(st);
-      if (end.phase === 'won') {
-        wins++;
-        break;
-      }
-      if (end.phase === 'lost') break;
-      const moves = legalMoves(st);
-      if (moves.length === 0) break;
-      const mv = moves[Math.floor(rng() * moves.length)];
-      applyTrayMove(st, mv);
-      resolveTurn(st, mv.cells);
-    }
-  }
-  return wins;
+/** Первые count элементов потока уровня — без изменения состояния */
+export function peekStream(n: number, count: number): TrayItem[] {
+  const cfg = levelConfig(n);
+  const out: TrayItem[] = [];
+  for (let i = 0; i < count; i++) out.push(streamItem(cfg.seed, i, cfg));
+  return out;
 }
 
-/* ------------------------------------------------------------------ */
-/* Генерация уровня                                                    */
-/* ------------------------------------------------------------------ */
-
-const cache = new Map<number, LevelData>();
-const GEN_SOLVE_BUDGET = 800;
-const GEN_RANDOM_GAMES = 400;
-const MAX_ATTEMPTS = 50;
-
-/**
- * Уровень по 1-номеру (n ≥ 4). Один и тот же номер всегда даёт один и тот
- * же LevelData (ТЗ п. 2.1). Порог случайной игры берётся с запасом ниже
- * тестовых порогов ТЗ (3%/1%): 6 побед из 400 на лёгких уровнях,
- * 2 из 400 на сложных. Крайний случай — первый решаемый уровень.
- */
-export function generateLevel(n: number): LevelData {
-  const cached = cache.get(n);
-  if (cached) return cached;
-  if (n < 4) throw new Error(`generateLevel: генерация с уровня 4, попросили ${n}`);
-
-  const set = flavorSetFor(n);
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    const seedBase = (Math.imul(n, 2654435761) + Math.imul(attempt, 40503) + 0x9e3779b9) >>> 0;
-    const rng = mulberry32(seedBase);
-    const params = curve(n, rng);
-    const level = tryBuild(params, rng, set);
-    if (!level) continue;
-
-    // дешёвый шлюз — порог случайной игры (ТЗ п. 2.4)
-    const wins = randomPlayWins(level, GEN_RANDOM_GAMES, (seedBase ^ 0x5bf03635) >>> 0);
-    const allowed = n >= 11 ? 2 : 6;
-    if (wins > allowed) continue;
-
-    // решаемость солвером (ТЗ п. 2.1)
-    const sol = solve(createInitialState(level), GEN_SOLVE_BUDGET);
-    if (!sol) continue;
-
-    cache.set(n, level);
-    return level;
-  }
-
-  // запасной выход: первый решаемый уровень без порога случайной игры —
-  // решаемость важнее качества рандома (ТЗ п. 2.1: 100% уровней решаются)
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    const seedBase = (Math.imul(n, 2654435761) + Math.imul(attempt, 40503) + 0x9e3779b9) >>> 0;
-    const rng = mulberry32(seedBase);
-    const params = curve(n, rng);
-    const level = tryBuild(params, rng, set);
-    if (!level) continue;
-    if (solve(createInitialState(level), GEN_SOLVE_BUDGET)) {
-      cache.set(n, level);
-      return level;
-    }
-  }
-
-  throw new Error(`generateLevel: не удалось собрать уровень ${n}`);
+/** Проверка вместимости тарелки (диагностика генератора) */
+export function slicesFit(slices: Flavor[]): boolean {
+  return slices.length >= 1 && slices.length <= CAP;
 }

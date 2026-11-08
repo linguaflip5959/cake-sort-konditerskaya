@@ -34,20 +34,22 @@ import {
   applyCompletion,
   applyTrayMove,
   applyTransfer,
+  bestMove,
+  CAKE_POINTS,
   canPlace,
   canPlaceDoubleAt,
-  cloneState,
+  COMBO_BONUS,
   createInitialState,
   evalEnd,
   findCompletion,
   freeCells,
   planNextTransfer,
-  totalCakes,
   type Move,
 } from './game/rules';
-import { getLevel, solve } from './game/levels';
+import { getLevel, topUpTray, levelConfig } from './game/levels';
 import {
   cloneTrayItem,
+  WINDOW,
   type CellIndex,
   type EndReason,
   type Flavor,
@@ -55,6 +57,7 @@ import {
   type LevelData,
   type Orientation,
   type Phase,
+  type Transfer,
   type TrayItem,
 } from './game/types';
 
@@ -65,17 +68,26 @@ import {
 export interface PuzzleStats {
   level: number;
   moves: number;
-  collected: number;
-  cakes: number;
-  /** есть ли двойная тарелка в видимом окне очереди (кнопка поворота) */
+  /** набранные очки (итерация 3) */
+  points: number;
+  /** цель уровня в очках */
+  target: number;
+  /** торт, который откроется за прохождение (иконка у прогрессбара) */
+  unlockFlavor: number;
+  /** золотая серия: все торты открыты */
+  golden: boolean;
+  /** есть ли двойная тарелка в видимой выдаче (кнопка поворота) */
   doubleInTray: boolean;
 }
 
 export interface PuzzleUI {
   onStats(s: PuzzleStats): void;
   onToast(text: string): void;
-  onLevelDone(level: number, moves: number): void;
-  onStuck(moves: number, collected: number, cakes: number, reason: EndReason): void;
+  /** уровень пройден: очков набрано, торт открыт (карточка победы) */
+  onLevelDone(level: number, moves: number, unlockFlavor: number, golden: boolean): void;
+  onStuck(moves: number, points: number, target: number, reason: EndReason): void;
+  /** всплывающие очки за собранный торт: экранные координаты ячейки */
+  onCakeScore?(sx: number, sy: number, flavor: Flavor, points: number, combo: number): void;
 }
 
 /** Визуальная тарелка: на поле или в очереди */
@@ -112,7 +124,6 @@ interface TrayView {
 
 interface BoardLayout {
   cellPositions: THREE.Vector3[];
-  slotPositions: THREE.Vector3[];
   side: number;
   tableZ: number;
   standZ: number;
@@ -137,10 +148,17 @@ const TRAY_Y = -0.45;
 const SECTOR = Math.PI / 3;
 /** Радиус захвата свободной ячейки при перетаскивании */
 const SNAP_DIST = CELL * 0.55;
-/** Масштаб двойной тарелки в слоте очереди — миниатюра (ТЗ п. 3.8) */
-const DOUBLE_QUEUE_SCALE = 0.58;
+/** Ширина слота выдачи для обычной тарелки */
+const Q_SINGLE_W = 2.3;
+/** Ширина слота выдачи для двойной тарелки (две полноразмерные тарелки) */
+const Q_DOUBLE_W = 4.9;
+/** Худший случай ширины выдачи: одна двойная + четыре обычные (для кадрирования) */
+const QUEUE_W_MAX = Q_DOUBLE_W + 4 * Q_SINGLE_W;
+/** Масштаб двойной тарелки в очереди — 1: половинки полноразмерные, как
+ *  обычные тарелки (ТЗ итерации 3 — «двойная как одинарная») */
+const DOUBLE_QUEUE_SCALE = 1.0;
 /** Масштаб двойной тарелки при перетаскивании */
-const DOUBLE_DRAG_SCALE = 0.85;
+const DOUBLE_DRAG_SCALE = 1.0;
 /** Радиус захвата пары ячеек при перетаскивании двойной */
 const PAIR_SNAP_DIST = CELL * 0.85;
 
@@ -157,7 +175,9 @@ function nearAngle(from: number, to: number): number {
   return from + d;
 }
 
-/** Поле rows×cols по центру; подставка сзади, полка очереди — отдельной зоной спереди */
+/** Поле rows×cols по центру; подставка сзади, полка выдачи — отдельной зоной спереди.
+ *  Слоты выдачи не фиксированы: их раскладывает queuePositions по факту
+ *  (двойная тарелка шире обычной). */
 function gridLayout(rows: number, cols: number): BoardLayout {
   const w = (cols - 1) * CELL;
   const h = (rows - 1) * CELL;
@@ -166,19 +186,33 @@ function gridLayout(rows: number, cols: number): BoardLayout {
   const tableBackZ = standZ - 1.15;
   const tableFrontZ = boardFrontZ + 0.55;
   const boardW = w + PLATE_RADIUS * 2;
-  const side = THREE.MathUtils.clamp(Math.max(boardW + 2.6, tableFrontZ - tableBackZ + 0.8), 8.8, 14.5);
+  // стол не уже худшего случая выдачи — полка всегда стоит на столе
+  const side = THREE.MathUtils.clamp(Math.max(boardW + 2.6, QUEUE_W_MAX + 1.2, tableFrontZ - tableBackZ + 0.8), 8.8, 16.4);
   const tableZ = (tableFrontZ + tableBackZ) / 2;
   // полка вплотную к реальному переднему краю стола (clamp может его расширить)
   const realFront = tableZ + side / 2;
   const queueZ = Math.max(tableFrontZ, realFront) + 0.62 + 1.28;
-  const slotPositions = [-2.35, 0, 2.35].map((x) => new THREE.Vector3(x, TRAY_Y, queueZ));
   const cellPositions: THREE.Vector3[] = [];
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
       cellPositions.push(new THREE.Vector3(c * CELL - w / 2, 0, r * CELL - h / 2));
     }
   }
-  return { cellPositions, slotPositions, side, tableZ, standZ, queueZ };
+  return { cellPositions, side, tableZ, standZ, queueZ };
+}
+
+/** Раскладка видимой выдачи: элементы в ряд по ширине (двойная шире),
+ *  ряд центрируется. Позиции пересчитываются после каждого хода. */
+function queuePositions(items: readonly TrayItem[], queueZ: number): THREE.Vector3[] {
+  const widths = items.map((it) => (it.kind === 'single' ? Q_SINGLE_W : Q_DOUBLE_W));
+  let total = 0;
+  for (const w of widths) total += w;
+  let x = -total / 2;
+  return items.map((_, i) => {
+    const c = x + widths[i] / 2;
+    x += widths[i];
+    return new THREE.Vector3(c, TRAY_Y, queueZ);
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -203,7 +237,9 @@ export class PuzzleEngine {
   private state!: GState;
   private level!: LevelData;
   private levelIdx = 0;
-  private targetCakes = 0;
+  private targetPoints = 0;
+  private unlockFlavor = 0;
+  private golden = false;
   private moves = 0;
   private phase: Phase = 'idle';
 
@@ -336,12 +372,14 @@ export class PuzzleEngine {
       pts.push(new THREE.Vector3(p.x + pad, 0, p.z + pad));
       pts.push(new THREE.Vector3(p.x, 2.25, p.z));
     }
-    for (const s of l.slotPositions) {
-      const slotPad = pad + 0.35; // двойная тарелка шире обычной
-      pts.push(new THREE.Vector3(s.x - slotPad, TRAY_Y, s.z + slotPad));
-      pts.push(new THREE.Vector3(s.x + slotPad, TRAY_Y, s.z + slotPad));
-      pts.push(new THREE.Vector3(s.x, DRAG_Y, s.z));
-    }
+    // выдача: кадрируем по худшему случаю ширины — камера не «дышит»
+    // на каждом ходу, когда состав выдачи меняется
+    const half = QUEUE_W_MAX / 2 + 0.95;
+    pts.push(new THREE.Vector3(-half, TRAY_Y, l.queueZ + 1.35));
+    pts.push(new THREE.Vector3(half, TRAY_Y, l.queueZ + 1.35));
+    pts.push(new THREE.Vector3(-half, TRAY_Y - 1.0, l.queueZ - 1.35));
+    pts.push(new THREE.Vector3(half, TRAY_Y - 1.0, l.queueZ - 1.35));
+    pts.push(new THREE.Vector3(0, DRAG_Y, l.queueZ));
     pts.push(new THREE.Vector3(-1.15, 0, l.standZ - 1.15));
     pts.push(new THREE.Vector3(1.15, 0, l.standZ - 1.15));
     pts.push(new THREE.Vector3(-1.1, 1.4, l.standZ));
@@ -468,7 +506,10 @@ export class PuzzleEngine {
     this.levelIdx = idx;
     this.level = getLevel(idx);
     this.state = createInitialState(this.level);
-    this.targetCakes = totalCakes(this.level);
+    const cfg = levelConfig(idx + 1);
+    this.targetPoints = this.state.target;
+    this.unlockFlavor = this.level.unlockFlavor ?? cfg.unlockFlavor;
+    this.golden = cfg.golden;
     this.moves = 0;
     this.phase = 'idle';
 
@@ -498,14 +539,16 @@ export class PuzzleEngine {
       spawnDelay += 0.07;
     }
 
-    // очередь: первые три элемента
-    for (let i = 0; i < Math.min(3, this.state.tray.length); i++) {
-      this.spawnTrayView(i, 0.3 + i * 0.09);
+    // выдача: первые WINDOW элементов (видимых)
+    const visible = this.state.tray.slice(0, WINDOW);
+    const pos = queuePositions(visible, this.layout.queueZ);
+    for (let i = 0; i < visible.length; i++) {
+      this.spawnTrayView(i, pos[i], 0.3 + i * 0.09);
     }
 
     this.frameLevel();
     this.emitStats();
-    this.ui.onToast(`Уровень ${idx + 1} — тортов: ${this.targetCakes}`);
+    this.ui.onToast(`Уровень ${idx + 1} — цель: ${this.targetPoints} очков`);
   }
 
   /** Метки ячеек поля: тёмный диск + тонкое золотое кольцо */
@@ -535,11 +578,11 @@ export class PuzzleEngine {
     }
   }
 
-  /** Мраморный поднос очереди на золотой кромке */
+  /** Мраморный поднос выдачи на золотой кромке — во всю худшую ширину */
   private buildQueueTray(): void {
     const g = new THREE.Group();
-    const trayW = 7.5;
-    const trayD = 2.55;
+    const trayW = QUEUE_W_MAX + 1.6;
+    const trayD = 2.6;
 
     // тёплое тёмное дерево — зона очереди отличается от мраморного поля
     const woodMat = new THREE.MeshStandardMaterial({ color: 0x5a3d22, roughness: 0.55, metalness: 0.06 });
@@ -606,9 +649,8 @@ export class PuzzleEngine {
     }
   }
 
-  private spawnTrayView(trayIdx: number, delay = 0): TrayView {
+  private spawnTrayView(trayIdx: number, pos: THREE.Vector3, delay = 0): TrayView {
     const item = this.state.tray[trayIdx];
-    const pos = this.layout.slotPositions[trayIdx];
     const tv: TrayView = { trayIdx, item, orientation: 0, single: null, double: null, pos: pos.clone() };
     if (item.kind === 'single') {
       const view = this.makePlateView(item.slices);
@@ -649,17 +691,20 @@ export class PuzzleEngine {
     return tv;
   }
 
-  /** После размещения: оставшиеся элементы сдвигаются, справа новый */
+  /** После размещения: очередь пополняется из потока, видимый ряд
+   *  пересчитывается (двойная шире обычной), справа появляется новая. */
   private refreshTray(): void {
+    topUpTray(this.level, this.state);
+    const visible = this.state.tray.slice(0, WINDOW);
+    const pos = queuePositions(visible, this.layout.queueZ);
     this.trayViews.forEach((tv, i) => {
       tv.trayIdx = i;
-      const target = this.layout.slotPositions[i];
-      tv.pos.copy(target);
+      tv.pos.copy(pos[i]);
       const g = this.trayGroup(tv);
-      gsap.to(g.position, { x: target.x, z: target.z, duration: 0.3, ease: 'power2.inOut', overwrite: 'auto' });
+      gsap.to(g.position, { x: pos[i].x, z: pos[i].z, duration: 0.3, ease: 'power2.inOut', overwrite: 'auto' });
     });
-    if (this.state.tray.length > this.trayViews.length) {
-      this.spawnTrayView(this.trayViews.length, 0.16);
+    if (this.trayViews.length < visible.length) {
+      this.spawnTrayView(this.trayViews.length, pos[this.trayViews.length], 0.16);
     }
     this.emitStats();
   }
@@ -1032,8 +1077,12 @@ export class PuzzleEngine {
     this.finishTurn();
   }
 
-  /** Перелёт кусочков с донора на получателя (ТЗ 8.3.6) */
-  private async playTransfer(t: { from: CellIndex; to: CellIndex; flavor: Flavor; count: number }): Promise<void> {
+  /**
+   * Перелёт кусочков по маршруту: соседним тарелкам — напрямую, дальше —
+   * цепочкой, с приземлением на каждой промежуточной тарелке и искрами
+   * на «транзитах» (правило соседних тарелок).
+   */
+  private async playTransfer(t: Transfer): Promise<void> {
     const fromView = this.plateViews.get(t.from);
     const toView = this.plateViews.get(t.to);
     if (!fromView || !toView) {
@@ -1046,44 +1095,75 @@ export class PuzzleEngine {
         moving.unshift(fromView.slices.splice(i, 1)[0]);
       }
     }
+    if (moving.length === 0) {
+      await pzDelay(0.12);
+      return;
+    }
 
     const baseSlot = toView.slices.length;
-    const flightDur = 0.42;
+    const chain = t.path.length > 2;
+    const segDur = chain ? 0.26 : 0.42;
+    const stagger = chain ? 0.11 : 0.07;
+    const segs = t.path.length - 1;
+
+    // мировые опорные точки маршрута (тарелки могли исчезнуть — берём ячейку)
+    const hops: Array<{ x: number; z: number }> = t.path.map((c) => {
+      const view = this.plateViews.get(c);
+      const pos = view ? view.pos : this.layout.cellPositions[c];
+      return { x: pos.x, z: pos.z };
+    });
+
     moving.forEach((m, i) => {
       const slot = baseSlot + i;
       toView.slices.push(m);
-      // репарентинг с сохранением мировой трансформации (группы без вращения/масштаба)
-      toView.group.attach(m);
       const targetY = SLOT_Y + slot * STAIR;
-      const targetRy = nearAngle(m.rotation.y, slotAngle(slot));
-      const peak = Math.max(m.position.y, SLOT_Y) + 1.25;
-      const delay = i * 0.07;
+      const targetRy = slotAngle(slot);
 
-      gsap.to(m.position, { x: 0, z: 0, duration: flightDur, delay, ease: 'power1.inOut', overwrite: 'auto' });
-      gsap.to(m.rotation, { y: targetRy, duration: flightDur, delay, ease: 'power1.inOut', overwrite: 'auto' });
-      gsap.to(m.position, { y: peak, duration: flightDur * 0.45, delay, ease: 'power1.out', overwrite: 'auto' });
-      gsap.to(m.position, {
-        y: targetY,
-        duration: flightDur * 0.55,
-        delay: delay + flightDur * 0.45,
-        ease: 'power1.in',
-        onComplete:
-          i === moving.length - 1
-            ? () => {
-                if (this.disposed) return;
-                this.burst(toView.pos.x, 0.5, toView.pos.z, 6, 0xf0d9a8);
-              }
-            : undefined,
+      // полёт в мировых координатах, посадка — в слот получателя
+      this.scene.attach(m);
+      const tl = gsap.timeline({ delay: i * stagger });
+      tl.to(m.rotation, { y: nearAngle(m.rotation.y, targetRy), duration: segs * segDur, ease: 'power1.inOut' }, 0);
+      tl.to(m.position, { y: 0.95, duration: segDur * 0.5, ease: 'power1.out' }, 0);
+      for (let s = 1; s < hops.length; s++) {
+        tl.to(m.position, { x: hops[s].x, z: hops[s].z, duration: segDur, ease: 'power1.inOut' }, (s - 1) * segDur);
+      }
+      tl.to(m.position, { y: targetY, duration: segDur * 0.7, ease: 'power1.in' }, Math.max(0, segs * segDur - segDur * 0.7));
+      tl.call(() => {
+        toView.group.attach(m);
+        m.position.set(0, targetY, 0);
+        m.rotation.y = targetRy;
+        if (i === moving.length - 1 && !this.disposed) {
+          this.burst(toView.pos.x, 0.5, toView.pos.z, 6, 0xf0d9a8);
+        }
       });
+
+      // искры на промежуточных тарелках — видно маршрут цепочки
+      if (i === 0) {
+        for (let s = 1; s < hops.length - 1; s++) {
+          tl.call(
+            () => {
+              if (!this.disposed) this.burst(hops[s].x, 0.55, hops[s].z, 3, 0xffd97a);
+            },
+            undefined,
+            (s - 1) * segDur + segDur * 0.45,
+          );
+        }
+      }
     });
 
-    await pzDelay(flightDur + Math.max(0, moving.length - 1) * 0.07 + 0.06);
+    await pzDelay(segs * segDur + (moving.length - 1) * stagger + 0.08);
   }
 
   /* --------------------------- Сборка торта --------------------------- */
 
-  /** Шесть одинаковых кусочков: торт с короной летит на подставку (ТЗ 5.7, 8.3.7–8) */
+  /** Шесть одинаковых кусочков: торт с короной летит на подставку (ТЗ 5.7, 8.3.7–8).
+ *  Очки за торт (с комбо-бонусом) всплывают над ячейкой (итерация 3). */
   private async playCake(cell: CellIndex, flavor: Flavor): Promise<void> {
+    // applyCompletion уже начислил очки и поднял комбо — повторяем расчёт для всплывашки
+    const combo = Math.max(1, this.state.combo);
+    const gained = CAKE_POINTS + COMBO_BONUS * (combo - 1);
+    const screen = this.screenPosCell(cell);
+    if (this.ui.onCakeScore) this.ui.onCakeScore(screen.x, screen.y, flavor, gained, combo);
     const view = this.plateViews.get(cell);
     if (!view) {
       await pzDelay(0.2);
@@ -1147,7 +1227,7 @@ export class PuzzleEngine {
         ease: 'power1.inOut',
       });
       tl.to(cake.position, { y: STAND_CAKE_Y, duration: 0.16, ease: 'power1.out' }, '<+=0.6');
-      tl.call(() => this.burst(0, STAND_CAKE_Y + 0.4, this.layout.standZ, 14, 0xffd97a));
+      tl.call(() => this.burst(0, STAND_CAKE_Y + 0.4, this.layout.standZ, combo > 1 ? 20 : 12, 0xffd97a));
       tl.to(cake.scale, { x: 0.01, y: 0.01, z: 0.01, duration: 0.28, ease: 'back.in(1.6)' }, '+=0.4');
       tl.to(cake.position, { y: STAND_CAKE_Y + 0.55, duration: 0.28, ease: 'power1.in' }, '<');
     });
@@ -1162,15 +1242,16 @@ export class PuzzleEngine {
     const end = evalEnd(this.state);
     if (end.phase === 'won') {
       this.phase = 'won';
-      this.burst(0, 2.0, this.layout.standZ, 20, 0xffd97a);
+      this.burst(0, 2.0, this.layout.standZ, 26, 0xffd97a);
       this.sfx.levelWin();
-      this.ui.onLevelDone(this.levelIdx + 1, this.moves);
+      this.emitStats();
+      this.ui.onLevelDone(this.levelIdx + 1, this.moves, this.unlockFlavor, this.golden);
       return;
     }
     if (end.phase === 'lost') {
       this.phase = 'lost';
       this.sfx.stuck();
-      this.ui.onStuck(this.moves, this.state.completed, this.targetCakes, end.reason);
+      this.ui.onStuck(this.moves, this.state.points, this.targetPoints, end.reason);
       return;
     }
     this.phase = 'idle';
@@ -1247,16 +1328,16 @@ export class PuzzleEngine {
   /* --------------------------- Подсказка ------------------------------ */
 
   /**
-   * Подсказка: солвер решает текущее состояние и подсвечивает элемент
-   * очереди и целевые ячейки первого хода; двойная тарелка показывается
-   * в нужной ориентации (ТЗ п. 3.7). Возвращает true, если показана.
+   * Подсказка (итерация 3): жадный ход на один шаг вперёд — моделирует
+   * каждое размещение и подсвечивает элемент выдачи и целевые ячейки;
+   * двойная тарелка показывается в нужной ориентации (ТЗ п. 3.7).
+   * Возвращает true, если подсказка показана.
    */
   hint(): boolean {
     if (this.phase !== 'idle' || this.disposed) return false;
-    const sol = solve(cloneState(this.state), 150000);
-    if (!sol || sol.length === 0) return false;
+    const mv = bestMove(this.state);
+    if (!mv) return false;
     this.sfx.hint();
-    const mv = sol[0];
     this.clearHints();
     const gen = this.gen;
     const tv = this.trayViews.find((v) => v.trayIdx === mv.trayIdx);
@@ -1309,8 +1390,10 @@ export class PuzzleEngine {
     this.ui.onStats({
       level: this.levelIdx + 1,
       moves: this.moves,
-      collected: this.state.completed,
-      cakes: this.targetCakes,
+      points: this.state.points,
+      target: this.targetPoints,
+      unlockFlavor: this.unlockFlavor,
+      golden: this.golden,
       doubleInTray: this.hasDoubleInTray(),
     });
   }
@@ -1323,6 +1406,17 @@ export class PuzzleEngine {
   nextLevel(): void {
     if (this.disposed) return;
     this.loadLevel(this.levelIdx + 1); // дальше — бесконечная генерация
+  }
+
+  /** Прогреть следующий уровень, пока игрок читает итоги (генерация
+   *  мгновенна — оставлено для совместимости UI). */
+  warmNext(): void {
+    if (this.disposed) return;
+    try {
+      getLevel(this.levelIdx + 1);
+    } catch {
+      /* не критично */
+    }
   }
 
   start(): void {
@@ -1382,10 +1476,11 @@ export class PuzzleEngine {
     };
   }
 
-  /** Экранные координаты элемента очереди по trayIdx (для e2e-тестов) */
+  /** Экранные координаты элемента выдачи по trayIdx (для e2e-тестов) */
   screenPosTray(trayIdx: number): { x: number; y: number } {
     const tv = this.trayViews.find((v) => v.trayIdx === trayIdx);
-    const pos = tv ? this.trayGroup(tv).position : this.layout.slotPositions[trayIdx];
+    const visible = this.state.tray.slice(0, WINDOW);
+    const pos = tv ? this.trayGroup(tv).position : queuePositions(visible, this.layout.queueZ)[trayIdx] ?? new THREE.Vector3();
     const v = pos.clone().setY(TRAY_Y + 0.4).project(this.camera);
     const rect = this.renderer.domElement.getBoundingClientRect();
     return {
@@ -1412,8 +1507,8 @@ export class PuzzleEngine {
   debugState(): {
     phase: string;
     moves: number;
-    collected: number;
-    cakes: number;
+    points: number;
+    target: number;
     free: number;
     tray: TrayItem[];
     board: Array<{ cell: number; flavors: number[] }>;
@@ -1424,8 +1519,8 @@ export class PuzzleEngine {
     return {
       phase: this.phase,
       moves: this.moves,
-      collected: this.state.completed,
-      cakes: this.targetCakes,
+      points: this.state.points,
+      target: this.targetPoints,
       free: freeCells(this.state).length,
       tray: this.state.tray.map(cloneTrayItem),
       board: this.state.board.flatMap((p, cell) => (p ? [{ cell, flavors: p.slices.map((s) => s.flavor) }] : [])),
@@ -1449,16 +1544,16 @@ export class PuzzleEngine {
     }
   }
 
-  /** Автоматическое прохождение уровня солвером (тесты) */
+  /** Автоматическое прохождение уровня жадной стратегией (тесты) */
   async autosolve(): Promise<void> {
     await this.waitIdle();
     if (this.phase !== 'idle' || this.disposed) return;
-    const sol = solve(cloneState(this.state), 200000);
-    if (!sol) return;
-    for (const mv of sol) {
+    for (let guard = 0; guard < 200; guard++) {
       if (this.disposed) return;
       await this.waitIdle();
       if (this.phase !== 'idle') return;
+      const mv = bestMove(this.state);
+      if (!mv) return;
       const tv = this.trayViews.find((v) => v.trayIdx === mv.trayIdx);
       if (!tv) return;
       if (tv.double && mv.orientation !== null) {
@@ -1467,6 +1562,7 @@ export class PuzzleEngine {
         tv.double.group.rotation.y = tv.double.rotY;
       }
       void this.placeFromTray(tv, mv.cells);
+      await pzDelay(80);
     }
     await this.waitIdle();
   }

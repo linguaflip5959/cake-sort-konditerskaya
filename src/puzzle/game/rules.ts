@@ -8,6 +8,7 @@
 
 import {
   CAP,
+  WINDOW,
   cloneTrayItem,
   type CellIndex,
   type EndReason,
@@ -18,6 +19,17 @@ import {
   type Orientation,
   type Transfer,
 } from './types';
+
+/* ------------------------------------------------------------------ */
+/* Очки (итерация 3)                                                   */
+/* ------------------------------------------------------------------ */
+
+/** Базовые очки за собранный торт */
+export const CAKE_POINTS = 100;
+/** Бонус за каждый следующий торт в одном ходу (комбо) */
+export const COMBO_BONUS = 25;
+/** Очки за каждый перелетевший кусочек (автосортировка) */
+export const MERGE_POINTS = 2;
 
 /* ------------------------------------------------------------------ */
 /* Соседство и свободные ячейки                                        */
@@ -92,6 +104,18 @@ function sharedFlavors(a: GPlate, b: GPlate): Flavor[] {
   return out.sort((x, y) => x - y);
 }
 
+/** Различные вкусы тарелки по возрастанию */
+function distinctFlavors(p: GPlate): Flavor[] {
+  const out: Flavor[] = [];
+  for (const s of p.slices) if (!out.includes(s.flavor)) out.push(s.flavor);
+  return out.sort((x, y) => x - y);
+}
+
+/** Свободное место на тарелке */
+function freeSpace(p: GPlate): number {
+  return CAP - p.slices.length;
+}
+
 /**
  * Получатель сегментов (ТЗ 5.4, итерация 2 п. 3.6):
  * 1) тарелка с большим числом кусочков данного вкуса;
@@ -121,11 +145,85 @@ export function chooseRecipient(
   return Math.min(a, b);
 }
 
+/* ------------------------------------------------------------------ */
+/* Цепочки соседних тарелок (новое правило)                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Цепочечный перенос от тарелки start (правило соседних тарелок):
+ * кусочки вкуса flavor перелетают на ДАЛЬНЮЮ тарелку, если маршрут до неё
+ * идёт по соседним тарелкам со свободным местом (транзит), а получатель
+ * держит тот же вкус. Направление — как у прямого переноса: побеждает
+ * тарелка, где этого вкуса больше (chooseRecipient). Маршрут — BFS:
+ * кратчайший и детерминированный.
+ *
+ * Тарелка start сама может быть и получателем (тогда донор — найденная
+ * тарелка, маршрут разворачивается). Полные тарелки не пропускают
+ * кусочки через себя, но сами отдавать могут.
+ */
+function planChainFrom(
+  state: GState,
+  start: CellIndex,
+  flavor: Flavor,
+  lastPlaced: readonly CellIndex[] | null,
+): Transfer | null {
+  const { cols, rows, board } = state;
+  const startPlate = board[start];
+  if (!startPlate || flavorCount(startPlate, flavor) === 0) return null;
+
+  const parent = new Map<CellIndex, CellIndex>();
+  const visited = new Set<CellIndex>([start]);
+  const queue: CellIndex[] = [start];
+
+  for (let qi = 0; qi < queue.length; qi++) {
+    const cell = queue[qi];
+    const plate = board[cell];
+    if (!plate) continue;
+    const hasFlavor = flavorCount(plate, flavor) > 0;
+    const space = freeSpace(plate);
+
+    if (cell !== start && hasFlavor) {
+      // кандидат в пару: восстановить маршрут start → cell
+      const path: CellIndex[] = [];
+      for (let c: CellIndex | undefined = cell; c !== undefined; c = parent.get(c)) {
+        path.push(c);
+        if (c === start) break;
+      }
+      path.reverse(); // [start, …транзиты…, cell]
+      const recipient = chooseRecipient(state, start, cell, flavor, lastPlaced);
+      if (recipient === start) {
+        // start — получатель: донор cell, маршрут разворачивается
+        const count = Math.min(freeSpace(startPlate), flavorCount(plate, flavor));
+        if (count > 0) return { from: cell, to: start, flavor, count, path: [...path].reverse() };
+      } else {
+        // cell — получатель: донор start
+        const count = Math.min(space, flavorCount(startPlate, flavor));
+        if (count > 0) return { from: start, to: cell, flavor, count, path };
+      }
+      // пара не сложилась (например, получатель полон) — cell может
+      // остаться транзитом, если на нём есть место
+    }
+
+    // транзит — только через тарелки со свободным местом; сама start
+    // может быть полна: она конец маршрута, а не транзит
+    if (cell !== start && space === 0) continue;
+    for (const nb of neighborCells(cols, rows, cell)) {
+      if (!visited.has(nb) && board[nb]) {
+        visited.add(nb);
+        parent.set(nb, cell);
+        queue.push(nb);
+      }
+    }
+  }
+  return null;
+}
+
 /**
  * Следующий атомарный перенос или null. Детерминированный порядок (ТЗ 5.6):
- * ячейки — по строкам сверху вниз, слева направо; пары — направления
- * «вправо, вниз» (каждая пара рассматривается один раз); вкусы — по возрастанию.
- * Одинаковый вход всегда даёт одинаковый результат.
+ * сначала прямые переносы между соседями — ячейки по строкам, пары
+ * «вправо, вниз», вкусы по возрастанию; затем цепочки — та же порядок
+ * обхода, маршрут кратчайший (BFS). Одинаковый вход всегда даёт
+ * одинаковый результат.
  */
 export function planNextTransfer(state: GState, lastPlaced: readonly CellIndex[] | null): Transfer | null {
   const { rows, cols, board } = state;
@@ -146,8 +244,17 @@ export function planNextTransfer(state: GState, lastPlaced: readonly CellIndex[]
         if (!donor || !recv) continue;
         const space = CAP - recv.slices.length;
         const count = Math.min(space, flavorCount(donor, f));
-        if (count > 0) return { from: donorCell, to: recipient, flavor: f, count };
+        if (count > 0) return { from: donorCell, to: recipient, flavor: f, count, path: [donorCell, recipient] };
       }
+    }
+  }
+  // цепочки: несоседние тарелки, связанные маршрутом через свободные места
+  for (let cell = 0; cell < board.length; cell++) {
+    const p = board[cell];
+    if (!p) continue;
+    for (const f of distinctFlavors(p)) {
+      const chain = planChainFrom(state, cell, f, lastPlaced);
+      if (chain) return chain;
     }
   }
   return null;
@@ -156,7 +263,8 @@ export function planNextTransfer(state: GState, lastPlaced: readonly CellIndex[]
 /**
  * Применить перенос: с донора уходят последние вхождения вкуса
  * (визуально — верхние кусочки), получатель принимает в конец списка.
- * Опустевшая тарелка удаляется с поля (ТЗ 6.2).
+ * Опустевшая тарелка удаляется с поля (ТЗ 6.2). Каждый перелетевший
+ * кусочек приносит MERGE_POINTS очков (итерация 3).
  */
 export function applyTransfer(state: GState, t: Transfer): void {
   const donor = state.board[t.from];
@@ -172,6 +280,7 @@ export function applyTransfer(state: GState, t: Transfer): void {
   }
   if (moved !== t.count) throw new Error(`applyTransfer: planned ${t.count}, moved ${moved}`);
   if (donor.slices.length === 0) state.board[t.from] = null;
+  state.points += MERGE_POINTS * moved;
 }
 
 /** Тарелка с шестью одинаковыми кусочками (ТЗ 5.7) */
@@ -185,10 +294,14 @@ export function findCompletion(state: GState): { cell: CellIndex; flavor: Flavor
   return null;
 }
 
-/** Удалить собранный торт из данных и освободить ячейку (ТЗ 5.7.3–5) */
+/** Удалить собранный торт из данных, освободить ячейку и начислить очки:
+ *  CAKE_POINTS + COMBO_BONUS за каждый следующий торт хода (ТЗ 5.7.3–5,
+ *  итерация 3 — очки вместо подсчёта тортов). */
 export function applyCompletion(state: GState, cell: CellIndex): void {
   state.board[cell] = null;
   state.completed += 1;
+  state.combo += 1;
+  state.points += CAKE_POINTS + COMBO_BONUS * (state.combo - 1);
 }
 
 /* ------------------------------------------------------------------ */
@@ -241,8 +354,10 @@ export function placeDouble(state: GState, trayIdx: number, cellA: CellIndex, ce
   return [makePlate(state, item.a, cellA), makePlate(state, item.b, cellB)];
 }
 
-/** Применить ход: размещение элемента очереди по определению mv */
+/** Применить ход: размещение элемента очереди по определению mv.
+ *  Начало хода — сброс счётчика комбо (итерация 3). */
 export function applyTrayMove(state: GState, mv: Move): GPlate[] {
+  state.combo = 0;
   const item = state.tray[mv.trayIdx];
   if (!item) throw new Error('applyTrayMove: bad tray index');
   if (item.kind === 'single') {
@@ -254,7 +369,7 @@ export function applyTrayMove(state: GState, mv: Move): GPlate[] {
 }
 
 /**
- * Все допустимые ходы из видимого окна очереди (3 тарелки).
+ * Все допустимые ходы из видимой выдачи (WINDOW = 5 тарелок).
  * Для двойной тарелки перебираются все свободные соседние пары и все
  * 4 ориентации: горизонтали — 0 (A слева) и 2 (A справа),
  * вертикали — 1 (A сверху) и 3 (A снизу) — ТЗ п. 3.4, 3.7.
@@ -262,7 +377,7 @@ export function applyTrayMove(state: GState, mv: Move): GPlate[] {
 export function legalMoves(state: GState): Move[] {
   const out: Move[] = [];
   const frees = freeCells(state);
-  const window = Math.min(3, state.tray.length);
+  const window = Math.min(WINDOW, state.tray.length);
   for (let ti = 0; ti < window; ti++) {
     const item = state.tray[ti];
     if (item.kind === 'single') {
@@ -291,7 +406,7 @@ export function legalMoves(state: GState): Move[] {
  * торт → повтор, пока есть допустимые переносы. lastPlaced — ячейки,
  * размещённые в текущем ходе (одна или две, ТЗ итерации 2 п. 3.6).
  * Гарантированно завершается: каждый перенос обнуляет вкус у донора.
- * Возвращает счётчики для эвристики солвера.
+ * Возвращает счётчики для эвристики подсказки.
  */
 export function resolveTurn(state: GState, lastPlaced: readonly CellIndex[]): { transfers: number; cakes: number } {
   let transfers = 0;
@@ -316,18 +431,23 @@ export function resolveTurn(state: GState, lastPlaced: readonly CellIndex[]): { 
 }
 
 /**
- * Итог хода: победа, поражение (с причиной) или играем дальше (ТЗ 6.3,
- * итерация 2 п. 3.7). Поражение full наступает и тогда, когда в видимом
- * окне очереди только двойные тарелки, а свободные ячейки не образуют
- * ни одной соседней пары.
+ * Итог хода: победа по очкам (итерация 3), поражение (с причиной) или
+ * играем дальше (ТЗ 6.3, итерация 2 п. 3.7). Для конечных уровней без
+ * цели (target = 0, тесты) сохранена победа по очистке поля.
+ * Поражение full наступает и тогда, когда в видимой выдаче только
+ * двойные тарелки, а свободные ячейки не образуют ни одной пары.
  */
 export function evalEnd(state: GState): { phase: 'playing' | 'won' } | { phase: 'lost'; reason: EndReason } {
-  const anyPlate = state.board.some((p) => p !== null);
-  if (!anyPlate && state.tray.length === 0) return { phase: 'won' };
+  if (state.target > 0) {
+    if (state.points >= state.target) return { phase: 'won' };
+  } else {
+    const anyPlate = state.board.some((p) => p !== null);
+    if (!anyPlate && state.tray.length === 0) return { phase: 'won' };
+  }
   if (state.tray.length === 0) return { phase: 'lost', reason: 'leftover' };
   const frees = freeCells(state);
   if (frees.length === 0) return { phase: 'lost', reason: 'full' };
-  const window = Math.min(3, state.tray.length);
+  const window = Math.min(WINDOW, state.tray.length);
   let onlyDoubles = true;
   for (let i = 0; i < window; i++) {
     if (state.tray[i].kind === 'single') {
@@ -360,6 +480,9 @@ export function createInitialState(level: LevelData): GState {
     board,
     tray: level.tray.map(cloneTrayItem),
     completed: 0,
+    points: 0,
+    target: level.target ?? 0,
+    combo: 0,
     nextPlateId: 1,
     nextSliceId: 1,
   };
@@ -376,7 +499,7 @@ export function createInitialState(level: LevelData): GState {
   return state;
 }
 
-/** Глубокая копия состояния (для солвера и тестов стабильности) */
+/** Глубокая копия состояния (для подсказки и тестов стабильности) */
 export function cloneState(s: GState): GState {
   return {
     rows: s.rows,
@@ -384,7 +507,75 @@ export function cloneState(s: GState): GState {
     board: s.board.map((p) => (p ? { id: p.id, cell: p.cell, slices: p.slices.map((x) => ({ ...x })) } : null)),
     tray: s.tray.map(cloneTrayItem),
     completed: s.completed,
+    points: s.points,
+    target: s.target,
+    combo: s.combo,
     nextPlateId: s.nextPlateId,
     nextSliceId: s.nextSliceId,
   };
 }
+
+/* ------------------------------------------------------------------ */
+/* Подсказка: жадный ход (итерация 3)                                  */
+/* ------------------------------------------------------------------ */
+
+/** Сколько соседств с совпадающими вкусами на поле (потенциал слияний) */
+export function sharedAdjacency(st: GState): number {
+  let total = 0;
+  for (let cell = 0; cell < st.board.length; cell++) {
+    const p = st.board[cell];
+    if (!p) continue;
+    const right = cell % st.cols < st.cols - 1 ? cell + 1 : -1;
+    const down = cell + st.cols < st.rows * st.cols ? cell + st.cols : -1;
+    for (const nb of [right, down]) {
+      const q = nb >= 0 ? st.board[nb] : null;
+      if (!q) continue;
+      const has = new Set(p.slices.map((s) => s.flavor));
+      for (const f of q.slices) if (has.has(f.flavor)) total++;
+    }
+  }
+  return total;
+}
+
+/**
+ * Лучший ход на один шаг вперёд (итерация 3): для каждого допустимого
+ * размещения моделируется полное разрешение хода. Сначала сравниваются
+ * набранные очки, затем «здоровье» поля: прогресс тарелок к торту
+ * (максимальное число одинаковых кусочков), соседства с совпадающими
+ * вкусами и свободные ячейки. Очередь бесконечна, поэтому полный поиск
+ * решения невозможен — жадная оценка и есть подсказка.
+ */
+export function bestMove(state: GState): Move | null {
+  const moves = legalMoves(state);
+  if (moves.length === 0) return null;
+  let best: Move | null = null;
+  let bestScore = -Infinity;
+  for (const mv of moves) {
+    const next = cloneState(state);
+    applyTrayMove(next, mv);
+    const rep = resolveTurn(next, mv.cells);
+    const gained = next.points - state.points;
+
+    // потенциал поля: насколько тарелки близки к тортам
+    let potential = 0;
+    for (const p of next.board) {
+      if (!p) continue;
+      const counts = new Map<Flavor, number>();
+      for (const s of p.slices) counts.set(s.flavor, (counts.get(s.flavor) ?? 0) + 1);
+      let maxSame = 0;
+      for (const c of counts.values()) if (c > maxSame) maxSame = c;
+      potential += maxSame * maxSame * 3;
+      // «мёртвые» тарелки: полные и разномастные — балласт на столе
+      if (p.slices.length >= CAP - 1 && maxSame < 3) potential -= 24;
+    }
+    potential += sharedAdjacency(next) * 5 + freeCells(next).length * 11;
+
+    const score = gained * 1000 + rep.transfers * 10 + potential;
+    if (score > bestScore) {
+      bestScore = score;
+      best = mv;
+    }
+  }
+  return best;
+}
+

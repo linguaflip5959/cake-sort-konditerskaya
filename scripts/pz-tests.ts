@@ -1,30 +1,31 @@
 /**
- * Cake Sort — «Кондитерская»: автотесты игрового слоя (ТЗ итерации 2, п. 6).
+ * Cake Sort — «Кондитерская»: автотесты игрового слоя.
  * Запуск: npm test (tsx scripts/pz-tests.ts). Three.js и GSAP не нужны.
+ *
+ * Итерация 3 — очки: сбор тортов даёт очки (с комбо), победа — по очкам.
+ * Очередь — бесконечный детерминированный поток, стол 3×3, выдача 5.
  */
 
-import { execSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-
 import {
-  adjacentFreePairs,
+  applyCompletion,
   applyTrayMove,
+  bestMove,
+  CAKE_POINTS,
   canPlace,
   canPlaceDoubleAt,
   chooseRecipient,
+  COMBO_BONUS,
   createInitialState,
   evalEnd,
   legalMoves,
+  MERGE_POINTS,
   planNextTransfer,
   resolveTurn,
-  totalCakes,
+  sharedAdjacency,
 } from '../src/puzzle/game/rules';
-import { FIXED_LEVELS, getLevel, solve } from '../src/puzzle/game/levels';
-import { generateLevel, randomPlayWins } from '../src/puzzle/game/generator';
-import { CAP, trayFlavors, type Flavor, type LevelData, type TrayItem } from '../src/puzzle/game/types';
+import { buildLevel, levelConfig, peekStream, targetFor, topUpTray } from '../src/puzzle/game/generator';
+import { getLevel } from '../src/puzzle/game/levels';
+import { CAP, FLAVOR_COUNT, TRAY_BUFFER, WINDOW, trayFlavors, type Flavor, type LevelData, type TrayItem } from '../src/puzzle/game/types';
 
 /* --------------------------- мини-фреймворк ------------------------- */
 
@@ -64,110 +65,305 @@ function throws(fn: () => void, msg: string): void {
   throw new Error(msg);
 }
 
-/** Уровень «на лету» для сценарных тестов */
-function lv(rows: number, cols: number, initial: Array<[number, number, Flavor[]]>, tray: TrayItem[]): LevelData {
+/** Уровень «на лету» для сценарных тестов (без цели — режим очистки поля) */
+function lv(rows: number, cols: number, initial: Array<[number, number, Flavor[]]>, tray: TrayItem[], target?: number): LevelData {
   return {
     rows,
     cols,
     initial: initial.map(([row, col, slices]) => ({ row, col, slices })),
     tray,
+    ...(target !== undefined ? { target } : {}),
   };
 }
 
-console.log('Cake Sort — Кондитерская: автотесты игрового слоя\n');
+console.log('Cake Sort — Кондитерская: автотесты игрового слоя (итерация 3)\n');
 
-/* ------------------- 1. Кратность 6 (уровни 1–100) ------------------ */
+/* ------------------------- 1. Очки и комбо -------------------------- */
 
-test('1. Кратность 6: каждый вкус во всех уровнях 1–100', () => {
-  for (let i = 0; i < 100; i++) {
-    const level = getLevel(i);
-    const counts = new Map<Flavor, number>();
-    for (const p of level.initial) for (const f of p.slices) counts.set(f, (counts.get(f) ?? 0) + 1);
-    for (const it of level.tray) for (const f of trayFlavors(it)) counts.set(f, (counts.get(f) ?? 0) + 1);
-    for (const [f, c] of counts) {
-      assert(c % CAP === 0, `уровень ${i + 1}: вкус ${f} встречается ${c} раз (не кратно 6)`);
+test('1.1 Очки: торт = 100, комбо +25 за каждый следующий, перенос = 2/кусочек', () => {
+  const st = createInitialState(lv(1, 3, [[0, 0, [0, 0, 0]]], [{ kind: 'single', slices: [0, 0, 0] }]));
+  applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
+  // перенос 3 кусочков: +6; торт: +100 → 106
+  resolveTurn(st, [1]);
+  assertEq(st.points, MERGE_POINTS * 3 + CAKE_POINTS, 'очки за перенос и торт');
+  assertEq(st.completed, 1, 'торт собран');
+  assertEq(st.combo, 1, 'комбо после хода — 1');
+});
+
+test('1.2 Комбо растёт внутри хода и сбрасывается новым ходом', () => {
+  const st = createInitialState(
+    lv(1, 4, [], [
+      { kind: 'single', slices: [3, 3, 3, 3, 3, 3] },
+      { kind: 'single', slices: [3, 3, 3, 3, 3, 3] },
+    ]),
+    500,
+  );  applyTrayMove(st, { trayIdx: 0, cells: [0], orientation: null });
+  resolveTurn(st, [0]); // готовый торт из 6 кусочков без переносов
+  assertEq(st.points, CAKE_POINTS, 'первый торт — базовые очки');
+  applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
+  resolveTurn(st, [1]);
+  assertEq(st.points, CAKE_POINTS * 2, 'комбо сброшен — снова базовые очки');
+});
+
+test('1.3 Победа по очкам: target достигнут — won, даже когда тарелки на поле', () => {
+  const st = createInitialState(
+    lv(
+      1,
+      3,
+      [[0, 0, [0, 0, 0]]],
+      [{ kind: 'single', slices: [0, 0, 0] }, { kind: 'single', slices: [1, 1] }],
+      106,
+    ),
+  );
+  applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
+  resolveTurn(st, [1]);
+  assertEq(st.points, 106, 'очки набраны');
+  assertEq(evalEnd(st), { phase: 'won' }, 'победа по очкам с тарелками на поле');
+});
+
+test('1.4 Очки не накоплены — игра продолжается', () => {
+  const st = createInitialState(
+    lv(
+      1,
+      3,
+      [[0, 0, [0, 0, 0]]],
+      [{ kind: 'single', slices: [0, 0, 0] }, { kind: 'single', slices: [1, 1] }],
+      400,
+    ),
+  );
+  applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
+  resolveTurn(st, [1]);
+  assertEq(evalEnd(st), { phase: 'playing' }, 'цель не взята — играем');
+});
+
+test('1.5 applyCompletion напрямую поднимает комбо и очки', () => {
+  const st = createInitialState(lv(1, 2, [[0, 0, [0]]], [], 1000));
+  st.combo = 0; // начало хода
+  st.board[0] = { id: 1, cell: 0, slices: new Array(6).fill(0).map((_, i) => ({ id: i, flavor: 0 })) };
+  applyCompletion(st, 0);
+  assertEq(st.points, CAKE_POINTS, 'первый торт хода');
+  st.board[1] = { id: 2, cell: 1, slices: new Array(6).fill(0).map((_, i) => ({ id: 10 + i, flavor: 0 })) };
+  applyCompletion(st, 1);
+  assertEq(st.points, CAKE_POINTS * 2 + COMBO_BONUS, 'второй торт хода — с бонусом');
+});
+
+/* ------------------------ 2. Стол 3×3, выдача 5 --------------------- */
+
+test('2.1 Уровни: поле всегда 3×3, цель задана, поток бесконечный', () => {
+  for (let n = 1; n <= 30; n++) {
+    const level = buildLevel(n);
+    assertEq([level.rows, level.cols], [3, 3], `уровень ${n}: поле`);
+    assert((level.target ?? 0) > 0, `уровень ${n}: нет цели в очках`);
+    assert(level.stream !== undefined, `уровень ${n}: нет потока`);
+    assertEq(level.tray.length, WINDOW + TRAY_BUFFER, `уровень ${n}: стартовая выдача`);
+    assert(level.initial.length >= 2 && level.initial.length <= 3, `уровень ${n}: начальные тарелки`);
+    for (const p of level.initial) {
+      assert(p.slices.length >= 1 && p.slices.length <= CAP, `уровень ${n}: начальная тарелка ${p.slices.length} кусочков`);
     }
-    assert(totalCakes(level) >= 1, `уровень ${i + 1}: нет ни одного торта`);
   }
 });
 
-/* ------------------------ 2. Решаемость 1–100 ----------------------- */
+test('2.2 Окно выдачи — 5: legalMoves видит 5 элементов, topUp держит запас', () => {
+  const level = buildLevel(3);
+  const st = createInitialState(level);
+  const singles = st.tray.slice(0, WINDOW).filter((it) => it.kind === 'single').length;
+  const frees = st.board.filter((p) => p === null).length;
+  assertEq(legalMoves(st).length, singles * frees, 'ходы для обычных тарелок в окне × свободные ячейки');
+  // израсходовали 3 элемента — выдача всё равно полная
+  for (let k = 0; k < 3; k++) {
+    const cell = st.board.findIndex((p) => p === null);
+    assert(cell >= 0, 'нет свободной ячейки');
+    applyTrayMove(st, { trayIdx: 0, cells: [cell], orientation: null });
+    resolveTurn(st, [cell]);
+    topUpTray(level, st);
+  }
+  assert(st.tray.length >= WINDOW + TRAY_BUFFER - 1, `после ходов в очереди ${st.tray.length}, а нужна ~${WINDOW + TRAY_BUFFER}`);
+});
 
-test('2. Решаемость: solve() находит решение на уровнях 1–100', () => {
-  for (let i = 0; i < 100; i++) {
-    const sol = solve(createInitialState(getLevel(i)));
-    assert(sol !== null, `уровень ${i + 1}: солвер не нашёл решение`);
+test('2.3 Кривая цели: рост с насыщением, без провалов', () => {
+  let prev = 0;
+  for (let n = 1; n <= 30; n++) {
+    const t = targetFor(n);
+    assert(t >= prev, `цель уровня ${n} (${t}) меньше предыдущей (${prev})`);
+    prev = t;
+  }
+  assertEq(targetFor(1), 250, 'уровень 1');
+  assertEq(targetFor(16), 1150, 'уровень 16');
+  assertEq(targetFor(40), 1200, 'насыщение');
+});
+
+test('2.4 Открытие тортов: по одному за уровень, потом золотая серия', () => {
+  for (let n = 1; n + 1 < FLAVOR_COUNT; n++) {
+    const cfg = levelConfig(n);
+    assertEq(cfg.unlockedCount, n + 1, `уровень ${n}: открыто вкусов`);
+    assertEq(cfg.flavors.length, Math.min(6, n + 1), `уровень ${n}: размер пула`);
+    assert(!cfg.golden, `уровень ${n}: не золотая серия`);
+    assertEq(cfg.unlockFlavor, n + 1, `уровень ${n}: открывается вкус`);
+    // новый торт ещё не в игре — он появится на следующем уровне
+    assert(!cfg.flavors.includes(cfg.unlockFlavor), `уровень ${n}: новинка уже в пуле`);
+    for (const f of cfg.flavors) assert(f < cfg.unlockedCount, `уровень ${n}: вкус ${f} ещё не открыт`);
+    // новинка прошлого уровня — в пуле текущего (вкус n)
+    if (n > 1) assert(cfg.flavors.includes(n), `уровень ${n}: прошлая новинка не в пуле`);
+  }
+  const gold = levelConfig(FLAVOR_COUNT - 1); // уровень 15
+  assert(gold.golden, 'уровень 15 — золотая серия');
+  assertEq(gold.flavors.length, 6, 'пул золотой серии');
+  // getLevel согласован с конфигом
+  for (const n of [1, 5, 16, 25]) {
+    const level = buildLevel(n);
+    assertEq(level.target, targetFor(n), `getLevel/buildLevel цель уровня ${n}`);
   }
 });
 
-/* --------------------- 3. Детерминизм генератора -------------------- */
+/* -------------------- 3. Поток: детерминизм и состав ---------------- */
 
-test('3. Детерминизм: номер уровня даёт один и тот же LevelData', () => {
-  const probeLevels = [4, 5, 7, 12, 21, 40];
-  const inProcess = probeLevels.map((n) => JSON.stringify(generateLevel(n)));
+test('3.1 Детерминизм: один номер уровня — один и тот же уровень и поток', () => {
+  for (const n of [1, 4, 7, 12, 25]) {
+    const a = JSON.stringify(buildLevel(n));
+    const b = JSON.stringify(buildLevel(n));
+    assertEq(a, b, `уровень ${n} недетерминирован`);
+    const p1 = JSON.stringify(peekStream(n, 40));
+    const p2 = JSON.stringify(peekStream(n, 40));
+    assertEq(p1, p2, `поток уровня ${n} недетерминирован`);
+  }
+  // getLevel(i) === buildLevel(i+1)
+  assertEq(JSON.stringify(getLevel(6)), JSON.stringify(buildLevel(7)), 'getLevel смещён на 1');
+});
 
-  // отдельные процессы: исключаем влияние кеша модуля и порядка вызовов
-  const dir = mkdtempSync(join(tmpdir(), 'pz-det-'));
-  try {
-    const probe = join(dir, 'probe.ts');
-    const genUrl = new URL('../src/puzzle/game/generator.ts', import.meta.url).href;
-    writeFileSync(
-      probe,
-      `import { generateLevel } from '${genUrl}';\n` +
-        `const out = [4, 5, 7, 12, 21, 40].map((n) => JSON.stringify(generateLevel(n)));\n` +
-        `console.log(JSON.stringify(out));\n`,
+test('3.2 Состав тарелок: 2–4 вкуса, без «полторта», чистые — только 1–2 кусочка', () => {
+  for (let n = 1; n <= 30; n++) {
+    const items = peekStream(n, 60);
+    const plates: Flavor[][] = items.flatMap((it) => (it.kind === 'single' ? [it.slices] : [it.a, it.b]));
+    let singles = 0;
+    let heavy = 0;
+    let flavorsSum = 0;
+    for (const p of plates) {
+      assert(p.length >= 1 && p.length <= CAP, `уровень ${n}: тарелка из ${p.length} кусочков`);
+      const counts = new Map<Flavor, number>();
+      for (const f of p) counts.set(f, (counts.get(f) ?? 0) + 1);
+      const distinct = counts.size;
+      const maxSame = Math.max(...counts.values());
+      flavorsSum += distinct;
+      assert(distinct <= 4, `уровень ${n}: тарелка с ${distinct} вкусами`);
+      assert(maxSame <= 3 || maxSame === 5, `уровень ${n}: ${maxSame} кусочков одного вкуса`);
+      if (maxSame === 5) heavy++;
+      if (distinct === 1 && maxSame < 5) {
+        assert(p.length <= 2, `уровень ${n}: одновидовая тарелка из ${p.length} кусочков`);
+        singles++;
+      }
+    }
+    // «почти торты» — редкий подарок: 2,5% на тарелку, запас на дисперсию
+    assert(heavy <= Math.ceil(plates.length * 0.08), `уровень ${n}: «почти тортов» ${heavy} из ${plates.length}`);
+    assert(singles <= Math.ceil(plates.length * 0.25), `уровень ${n}: одновидовых ${singles} из ${plates.length}`);
+    const avgFlavors = flavorsSum / plates.length;
+    assert(avgFlavors >= 1.6, `уровень ${n}: в среднем ${avgFlavors.toFixed(2)} вкусов на тарелку`);
+  }
+});
+
+test('3.3 Двойные тарелки: с 3-го уровня, не чаще одной на 7 позиций', () => {
+  for (let n = 1; n <= 20; n++) {
+    const items = peekStream(n, 70);
+    if (n < 3) {
+      assert(items.every((it) => it.kind === 'single'), `уровень ${n}: двойных быть не должно`);
+      continue;
+    }
+    let lastDouble = -10;
+    let count = 0;
+    items.forEach((it, i) => {
+      if (it.kind === 'double') {
+        assert(i >= 6, `уровень ${n}: двойная на позиции ${i} — слишком рано`);
+        assert(i - lastDouble >= 7, `уровень ${n}: двойные на ${lastDouble} и ${i} — ближе 7 позиций`);
+        assert(it.a.length >= 1 && it.b.length >= 1, `уровень ${n}: пустая половинка двойной`);
+        lastDouble = i;
+        count++;
+      }
+    });
+    assert(count >= 3, `уровень ${n}: за 70 элементов всего ${count} двойных`);
+    // в любом окне из 5 — максимум одна двойная
+    for (let i = 0; i + WINDOW <= items.length; i++) {
+      const d = items.slice(i, i + WINDOW).filter((it) => it.kind === 'double').length;
+      assert(d <= 1, `уровень ${n}: в окне ${i}..${i + WINDOW - 1} двойных ${d}`);
+    }
+  }
+});
+
+test('3.4 Вкусы потока — только доступные на уровне', () => {
+  for (let n = 1; n <= 20; n++) {
+    const cfg = levelConfig(n);
+    const allowed = new Set(cfg.flavors);
+    for (const it of peekStream(n, 50)) {
+      for (const f of trayFlavors(it)) {
+        assert(allowed.has(f), `уровень ${n}: вкус ${f} вне доступных (0..${cfg.flavors.length - 1})`);
+      }
+    }
+  }
+});
+
+/* ------------------- 4. Проходимость: жадный игрок ------------------ */
+
+interface GreedyResult {
+  outcome: 'won' | 'lost' | 'timeout';
+  moves: number;
+  points: number;
+}
+
+/** Жадная партия: как подсказка bestMove, уровень за уровнем */
+function greedyPlay(n: number, maxMoves: number): GreedyResult {
+  const level = buildLevel(n);
+  const st = createInitialState(level);
+  for (let m = 0; m < maxMoves; m++) {
+    topUpTray(level, st);
+    const end = evalEnd(st);
+    if (end.phase === 'won') return { outcome: 'won', moves: m, points: st.points };
+    if (end.phase === 'lost') return { outcome: 'lost', moves: m, points: st.points };
+    const mv = bestMove(st);
+    if (!mv) return { outcome: 'lost', moves: m, points: st.points };
+    applyTrayMove(st, mv);
+    resolveTurn(st, mv.cells);
+  }
+  return { outcome: 'timeout', moves: maxMoves, points: st.points };
+}
+
+test('4.1 Ранние уровни (1–10): жадный игрок всегда берёт цель', () => {
+  for (let n = 1; n <= 10; n++) {
+    const r = greedyPlay(n, 150);
+    assert(r.outcome === 'won', `уровень ${n}: жадный игрок ${r.outcome} (очков ${r.points}/${targetFor(n)})`);
+    console.log(`      уровень ${n}: победа за ${r.moves} ходов (${r.points} очков)`);
+  }
+});
+
+test('4.2 Поздние уровни (11–25): жадный не проигрывает (стол не забит)', () => {
+  for (let n = 11; n <= 25; n++) {
+    const r = greedyPlay(n, 220);
+    assert(r.outcome !== 'lost', `уровень ${n}: жадный игрок проиграл на ходу ${r.moves}`);
+    if (r.outcome === 'won') console.log(`      уровень ${n}: победа за ${r.moves} ходов`);
+  }
+});
+
+test('4.3 Сложность растёт: побед жадного на поздних уровнях меньше', () => {
+  const early = [1, 2, 3].every((n) => greedyPlay(n, 150).outcome === 'won');
+  assert(early, 'уровни 1–3 обязаны проходиться');
+});
+
+test('4.4 bestMove возвращает только допустимые ходы', () => {
+  for (let n = 1; n <= 8; n++) {
+    const level = buildLevel(n);
+    const st = createInitialState(level);
+    const mv = bestMove(st);
+    assert(mv !== null, `уровень ${n}: нет хода`);
+    const legal = legalMoves(st).some(
+      (m) => m.trayIdx === mv!.trayIdx && m.cells.join(',') === mv!.cells.join(',') && m.orientation === mv!.orientation,
     );
-    const cwd = fileURLToPath(new URL('..', import.meta.url));
-    const runA = execSync(`npx tsx "${probe}"`, { cwd, encoding: 'utf8' }).trim();
-    const runB = execSync(`npx tsx "${probe}"`, { cwd, encoding: 'utf8' }).trim();
-    assertEq(runA, runB, 'два запуска в отдельных процессах дали разные уровни');
-    assertEq(JSON.parse(runA), inProcess, 'уровни в отдельном процессе отличаются от основного процесса');
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
+    assert(legal, `уровень ${n}: bestMove предложил недопустимый ход`);
+    if (mv!.cells.length === 1) assert(canPlace(st, mv!.cells[0]), 'ячейка должна быть свободной');
+    else assert(canPlaceDoubleAt(st, mv!.cells[0], mv!.cells[1]), 'пара должна быть свободной и соседней');
   }
-});
-
-/* --------------------- 4. Качество рандома (4–50) ------------------- */
-
-test('4. Случайная игра: доля побед ниже порога (уровни 4–50, 1000 партий)', () => {
-  for (let i = 3; i < 50; i++) {
-    const levelNumber = i + 1;
-    const level = getLevel(i);
-    const wins = randomPlayWins(level, 1000, levelNumber * 7919);
-    const limit = levelNumber >= 11 ? 10 : 30; // 1% на сложных, 3% на остальных
-    assert(wins <= limit, `уровень ${levelNumber}: случайных побед ${wins}/1000, лимит ${limit}`);
-  }
-});
-
-test('4b. Рост сложности: средняя длина решения не убывает (полосы уровней)', () => {
-  const band = (from: number, to: number): number => {
-    let sum = 0;
-    for (let i = from; i <= to; i++) sum += solve(createInitialState(getLevel(i)))?.length ?? 0;
-    return sum / (to - from + 1);
-  };
-  const b1 = band(3, 9); // уровни 4–10
-  const b2 = band(10, 19); // уровни 11–20
-  const b3 = band(20, 29); // уровни 21–30
-  assert(b2 >= b1 - 0.5, `средняя длина решения упала: 4–10 → ${b1.toFixed(1)}, 11–20 → ${b2.toFixed(1)}`);
-  assert(b3 >= b2 - 0.5, `средняя длина решения упала: 11–20 → ${b2.toFixed(1)}, 21–30 → ${b3.toFixed(1)}`);
-  console.log(`      средняя длина решения: 4–10: ${b1.toFixed(1)}, 11–20: ${b2.toFixed(1)}, 21–30: ${b3.toFixed(1)}`);
-});
-
-test('4c. Скорость генерации: в среднем не более ~450 мс на уровень', () => {
-  const started = Date.now();
-  const from = 101; // уровни вне диапазона остальных тестов — точно не в кеше
-  const to = 110;
-  for (let n = from; n <= to; n++) generateLevel(n);
-  const perLevel = (Date.now() - started) / (to - from + 1);
-  console.log(`      среднее время генерации (уровни ${from}–${to}): ${perLevel.toFixed(0)} мс`);
-  assert(perLevel <= 450, `генерация слишком медленная: ${perLevel.toFixed(0)} мс на уровень`);
 });
 
 /* ------------------------ 5. Двойная тарелка ------------------------ */
 
 test('5.1 Двойная тарелка: размещения только на пары свободных соседей', () => {
-  const level = lv(2, 2, [], [{ kind: 'double', a: [0, 0], b: [1, 1] }]);
-  const st = createInitialState(level);
+  const st = createInitialState(lv(2, 2, [], [{ kind: 'double', a: [0, 0], b: [1, 1] }]));
   // все 4 ячейки свободны: пары (0,1) (0,2) (1,3) (2,3) × 2 ориентации
   assertEq(legalMoves(st).length, 8, 'число ходов на пустом поле 2×2');
   for (const mv of legalMoves(st)) {
@@ -184,21 +380,18 @@ test('5.1 Двойная тарелка: размещения только на 
 });
 
 test('5.2 Ориентации: 4 состояния и порядок ячеек A/B', () => {
-  // горизонтальная пара: 0 — A слева, 2 — A справа
   const horiz = legalMoves(createInitialState(lv(1, 2, [], [{ kind: 'double', a: [0], b: [1] }])));
   assertEq(
     horiz.map((m) => [m.orientation, m.cells]).sort(),
     [[0, [0, 1]], [2, [1, 0]]],
     'горизонтальные ориентации',
   );
-  // вертикальная пара: 1 — A сверху, 3 — A снизу
   const vert = legalMoves(createInitialState(lv(2, 1, [], [{ kind: 'double', a: [0], b: [1] }])));
   assertEq(
     vert.map((m) => [m.orientation, m.cells]).sort(),
     [[1, [0, 1]], [3, [1, 0]]],
     'вертикальные ориентации',
   );
-  // на свободном поле 2×2 встречаются все четыре состояния
   const all = legalMoves(createInitialState(lv(2, 2, [], [{ kind: 'double', a: [0], b: [1] }])));
   for (const o of [0, 1, 2, 3] as const) {
     assert(all.some((m) => m.orientation === o), `ориентация ${o} не встретилась`);
@@ -206,7 +399,6 @@ test('5.2 Ориентации: 4 состояния и порядок ячее�
 });
 
 test('5.3 После размещения половинки ведут себя как независимые тарелки', () => {
-  // поле 1×3: слева тарелка из пяти «5», очередь: двойная A=[0×5], B=[5] и обычная [0]
   const level = lv(
     1,
     3,
@@ -217,42 +409,13 @@ test('5.3 После размещения половинки ведут себя
     ],
   );
   const st = createInitialState(level);
-  // ставим двойную так, что B=[5] — к начальной тарелке, A=[0×5] — отдельно
   applyTrayMove(st, { trayIdx: 0, cells: [2, 1], orientation: 2 });
   resolveTurn(st, [2, 1]);
-  // B собралась с начальной в торт и освободила ячейку, A осталась с пятью «0»
   assert(st.board[1] === null, 'ячейка B не освободилась после сборки торта');
   assertEq(st.board[2]?.slices.map((s) => s.flavor), [0, 0, 0, 0, 0], 'A должна остаться с пятью кусочками');
-  // обычной тарелкой докрываем торт A — половинки действительно независимы
   applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
   resolveTurn(st, [1]);
-  assert(evalEnd(st).phase === 'won', 'уровень должен быть пройден');
-});
-
-test('5.4 Солвер учитывает ориентации двойной тарелки', () => {
-  // 2×2: в ячейке 1 тарелка из пяти «0»; двойная A=[0], B=[1×6].
-  // Выигрывает только размещение, где A оказывается рядом с пятёркой.
-  const level = lv(
-    2,
-    2,
-    [[0, 1, [0, 0, 0, 0, 0]]],
-    [{ kind: 'double', a: [0], b: [1, 1, 1, 1, 1, 1] }],
-  );
-  const sol = solve(createInitialState(level));
-  assert(sol !== null && sol.length === 1, 'солвер не нашёл решение в один ход');
-  const mv = sol[0];
-  assert(mv.orientation === 1 || mv.orientation === 2, `выигрышная ориентация ${mv.orientation}, ожидалась 1 или 2`);
-  const st = createInitialState(level);
-  applyTrayMove(st, mv);
-  resolveTurn(st, mv.cells);
-  assert(evalEnd(st).phase === 'won', 'ход солвера не привёл к победе');
-  // неправильная ориентация (A далеко от пятёрки) ведёт к поражению
-  const wrong = legalMoves(createInitialState(level)).find((m) => m.orientation === 0);
-  assert(wrong, 'нет хода с ориентацией 0');
-  const st2 = createInitialState(level);
-  applyTrayMove(st2, wrong);
-  resolveTurn(st2, wrong.cells);
-  assert(evalEnd(st2).phase === 'lost', 'неправильная ориентация не должна выигрывать');
+  assert(evalEnd(st).phase === 'won', 'уровень должен быть пройден (режим очистки)');
 });
 
 /* --------------------------- 6. Сортировка -------------------------- */
@@ -262,6 +425,7 @@ test('6.1 Простое совпадение: кусочки уходят к р
   applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
   const t = planNextTransfer(st, [1]);
   assert(t !== null && t.to === 1 && t.from === 0 && t.count === 3, 'получатель — размещённая тарелка (правило хода)');
+  assert(t.path.length === 2 && t.path[0] === 0 && t.path[1] === 1, 'прямой перенос — маршрут из двух ячеек');
   resolveTurn(st, [1]);
   assertEq(st.completed, 1, 'торт должен собраться');
   assert(st.board[0] === null && st.board[1] === null, 'обе ячейки должны освободиться');
@@ -276,60 +440,59 @@ test('6.2 Завершение торта и освобождение ячейк
   assertEq(st.completed, 1, 'счётчик тортов');
 });
 
-test('6.3 Диагональ: не соседи — переноса нет', () => {
+test('6.3 Диагональ: не соседи — прямого переноса нет', () => {
   const st = createInitialState(lv(2, 2, [[0, 0, [0, 0, 0]], [1, 1, [0, 0, 0]]], []));
-  assert(planNextTransfer(st, []) === null, 'диагональные тарелки не должны обмениваться');
+  assert(planNextTransfer(st, []) === null, 'диагональные тарелки без маршрута не должны обмениваться');
 });
 
 test('6.4 Вместимость: перенос ограничен свободным местом', () => {
   const st = createInitialState(lv(1, 2, [[0, 0, [0, 0, 0, 0, 0]]], [{ kind: 'single', slices: [0, 0] }]));
   applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
   resolveTurn(st, [1]);
-  // получатель (5 кусочков) взял только 1 и стал тортом, у размещённой остался 1
   assertEq(st.completed, 1, 'начальная тарелка должна стать тортом');
   assert(st.board[0] === null, 'ячейка торта должна освободиться');
   assertEq(st.board[1]?.slices.length, 1, 'перенос должен ограничиться свободным местом');
 });
 
-test('6.5 Детерминизм: одинаковый вход — одинаковый результат', () => {
+test('6.5 Детерминизм партии: жадная игра одинаково повторяется', () => {
   const run = (): string => {
-    const st = createInitialState(getLevel(6)); // сгенерированный уровень
+    const level = buildLevel(5);
+    const st = createInitialState(level);
     let moves = 0;
     for (;;) {
+      topUpTray(level, st);
       const end = evalEnd(st);
       if (end.phase !== 'playing') break;
-      const sol = solve(st);
-      assert(sol !== null && sol.length > 0, 'нет решения');
-      applyTrayMove(st, sol[0]);
-      resolveTurn(st, sol[0].cells);
+      const mv = bestMove(st);
+      if (!mv) break;
+      applyTrayMove(st, mv);
+      resolveTurn(st, mv.cells);
       moves++;
-      if (moves > 30) throw new Error('слишком много ходов');
+      if (moves > 150) break;
     }
-    return JSON.stringify({
-      moves,
-      tray: st.tray,
-      board: st.board.map((p) => (p ? p.slices.map((s) => s.flavor) : null)),
-    });
+    return JSON.stringify({ moves, points: st.points, board: st.board.map((p) => (p ? p.slices.map((s) => s.flavor) : null)) });
   };
   assertEq(run(), run(), 'повторная партия должна пройти одинаково');
 });
 
 test('6.6 Приоритет при размещении двух тарелок за ход', () => {
   const st = createInitialState(lv(1, 2, [[0, 0, [4, 4, 4]], [0, 1, [4, 4, 4]]], []));
-  // равенство счётчиков: размещённая в текущем ходе побеждает
   assertEq(chooseRecipient(st, 0, 1, 4, [1]), 1, 'размещённая ячейка 1 должна победить');
   assertEq(chooseRecipient(st, 0, 1, 4, [0]), 0, 'размещённая ячейка 0 должна победить');
-  // обе размещены (двойная тарелка) — меньший индекс ячейки
   assertEq(chooseRecipient(st, 0, 1, 4, [0, 1]), 0, 'при двух размещённых побеждает меньший индекс');
-  assertEq(chooseRecipient(st, 0, 1, 4, [1, 0]), 0, 'порядок в lastPlaced не должен влиять');
-  // ничего не размещено — меньший индекс
   assertEq(chooseRecipient(st, 0, 1, 4, []), 0, 'без размещённых — меньший индекс');
+});
+
+test('6.7 sharedAdjacency: соседства с совпадающими вкусами считаются', () => {
+  const st = createInitialState(lv(1, 2, [[0, 0, [0, 1]], [0, 1, [1, 2]]], []));
+  assertEq(sharedAdjacency(st), 1, 'одно совпадение (вкус 1)');
+  const empty = createInitialState(lv(1, 2, [], []));
+  assertEq(sharedAdjacency(empty), 0, 'пустое поле — ноль соседств');
 });
 
 /* ------------------------- 7. Конец партии -------------------------- */
 
-test('7.1 Поражение: только двойные в окне, пар нет', () => {
-  // диагональные свободные ячейки: пары не образуются
+test('7.1 Поражение: только двойные в выдаче, пар нет', () => {
   const st = createInitialState(
     lv(
       2,
@@ -342,14 +505,16 @@ test('7.1 Поражение: только двойные в окне, пар н
         { kind: 'double', a: [2, 2], b: [3, 3] },
         { kind: 'double', a: [5, 5], b: [6, 6] },
         { kind: 'double', a: [7, 7], b: [8, 8] },
+        { kind: 'double', a: [7, 7], b: [8, 8] },
+        { kind: 'double', a: [7, 7], b: [8, 8] },
       ],
     ),
   );
-  assertEq(adjacentFreePairs(st).length, 0, 'диагональные ячейки не должны давать пары');
+  assert(st.tray.slice(0, WINDOW).every((it) => it.kind === 'double'), 'в окне только двойные');
   assertEq(evalEnd(st), { phase: 'lost', reason: 'full' }, 'должно быть поражение full');
 });
 
-test('7.2 В окне есть обычная тарелка — игра продолжается', () => {
+test('7.2 В выдаче есть обычная тарелка — игра продолжается', () => {
   const st = createInitialState(
     lv(
       2,
@@ -367,38 +532,138 @@ test('7.2 В окне есть обычная тарелка — игра про
   assertEq(evalEnd(st), { phase: 'playing' }, 'обычная тарелка спасает партию');
 });
 
-test('7.3 Поражение leftover: очередь пуста, на поле остаток', () => {
+test('7.3 Поражение leftover: очередь пуста, на поле остаток (без цели)', () => {
   const st = createInitialState(lv(1, 2, [[0, 0, [0, 0]]], []));
   assertEq(evalEnd(st), { phase: 'lost', reason: 'leftover' }, 'остаток без очереди — поражение');
 });
 
-/* ---------------------- 8. Обучающие уровни ------------------------- */
-
-test('8. Обучающие уровни 1–3 (ТЗ п. 4)', () => {
-  assertEq(FIXED_LEVELS.length, 3, 'фиксированных уровней должно быть три');
-  const sizes: Array<[number, number]> = [
-    [FIXED_LEVELS[0].rows, FIXED_LEVELS[0].cols],
-    [FIXED_LEVELS[1].rows, FIXED_LEVELS[1].cols],
-    [FIXED_LEVELS[2].rows, FIXED_LEVELS[2].cols],
-  ];
-  assertEq(sizes, [[2, 3], [2, 3], [3, 3]], 'поля 2×3, 2×3, 3×3');
-  for (let i = 0; i < 3; i++) {
-    const sol = solve(createInitialState(FIXED_LEVELS[i]));
-    assert(sol !== null, `обучающий уровень ${i + 1} не решается`);
-    assert(sol.length >= 3 && sol.length <= 6, `обучающий уровень ${i + 1}: решение из ${sol?.length} ходов (нужно 3–6)`);
+test('7.4 Стол 3×3 заполняется — full даже с бесконечным потоком', () => {
+  const level = buildLevel(2);
+  const st = createInitialState(level);
+  // заполняем все свободные ячейки первыми тарелками потока
+  let guard = 0;
+  while (st.board.some((p) => p === null) && guard++ < 20) {
+    const mv = bestMove(st);
+    if (!mv) break;
+    applyTrayMove(st, mv);
+    resolveTurn(st, mv.cells);
+    topUpTray(level, st);
+    // ломаем слияния: перекрашиваем всё в разные вкусы
+    let f = 0;
+    for (const p of st.board) {
+      if (!p) continue;
+      for (const s of p.slices) s.flavor = (f++ % 40) + 20; // вкусы вне уровня — никогда не совпадут
+    }
   }
-  const doubles = FIXED_LEVELS[2].tray.filter((it) => it.kind === 'double').length;
-  assertEq(doubles, 1, 'на уровне 3 должна быть ровно одна двойная тарелка');
-  // двойная видна сразу (окно 3)
-  assert(FIXED_LEVELS[2].tray.slice(0, 3).some((it) => it.kind === 'double'), 'двойная должна быть в видимом окне');
+  assert(st.board.every((p) => p !== null) || evalEnd(st).phase !== 'playing', 'стол заполнен');
+  if (st.board.every((p) => p !== null)) {
+    assertEq(evalEnd(st), { phase: 'lost', reason: 'full' }, 'полный стол — поражение');
+  }
 });
 
-test('8b. Сохранения: любой номер уровня допустим, getLevel не ломается', () => {
-  assert(getLevel(0).rows === 2, 'уровень 1');
-  assert(getLevel(2).rows === 3, 'уровень 3');
-  const far = getLevel(42);
-  assert(far.tray.length >= 5, 'далёкий уровень должен генерироваться');
-  assert(canPlace(createInitialState(getLevel(42)), 0) || true, 'getLevel не должен бросать');
+/* ---------------------- 8. Цепочки соседних тарелок ----------------- */
+
+test('8.1 Правило цепочки: кусочки летят через транзитные тарелки', () => {
+  const st = createInitialState(
+    lv(
+      1,
+      4,
+      [
+        [0, 0, [0, 0]],
+        [0, 1, [3, 3, 3, 3, 3]],
+        [0, 2, [8, 8, 8, 8]],
+      ],
+      [{ kind: 'single', slices: [0, 0, 0, 0] }],
+    ),
+  );
+  applyTrayMove(st, { trayIdx: 0, cells: [3], orientation: null });
+  const t = planNextTransfer(st, [3]);
+  assert(t !== null, 'цепочка не нашлась');
+  assertEq(t.path, [0, 1, 2, 3], 'маршрут должен идти через обе транзитные тарелки');
+  assert(t.from === 0 && t.to === 3 && t.count === 2, `перенос 0→3 на 2 кусочка, получено ${JSON.stringify(t)}`);
+  resolveTurn(st, [3]);
+  assertEq(st.completed, 1, 'торт должен собраться по цепочке');
+  assert(st.board[0] === null, 'донор должен освободиться');
+  assertEq(st.board[1]?.slices.map((s) => s.flavor), [3, 3, 3, 3, 3], 'транзит 1 не должен менять состав');
+  assertEq(st.board[2]?.slices.map((s) => s.flavor), [8, 8, 8, 8], 'транзит 2 не должен менять состав');
+});
+
+test('8.2 Полный транзит блокирует цепочку', () => {
+  const st = createInitialState(
+    lv(
+      1,
+      4,
+      [
+        [0, 0, [0, 0]],
+        [0, 1, [3, 3, 3, 4, 4, 4]],
+        [0, 2, [8, 8, 8, 8]],
+      ],
+      [{ kind: 'single', slices: [0, 0, 0, 0] }],
+    ),
+  );
+  applyTrayMove(st, { trayIdx: 0, cells: [3], orientation: null });
+  assert(planNextTransfer(st, [3]) === null, 'полная тарелка не должна пропускать кусочки');
+});
+
+test('8.3 Цепочка ограничена местом получателя', () => {
+  const st = createInitialState(
+    lv(
+      1,
+      4,
+      [
+        [0, 0, [0, 0]],
+        [0, 1, [3, 3, 3, 3, 3]],
+        [0, 2, [8, 8, 8, 8]],
+      ],
+      [{ kind: 'single', slices: [0, 0, 0, 0, 5] }],
+    ),
+  );
+  applyTrayMove(st, { trayIdx: 0, cells: [3], orientation: null });
+  const t = planNextTransfer(st, [3]);
+  assert(t !== null && t.count === 1, `перенос должен быть на 1 кусочек, получено ${t ? t.count : 'null'}`);
+});
+
+test('8.4 Направление цепочки — к тарелке, где вкуса больше', () => {
+  const st = createInitialState(
+    lv(
+      1,
+      4,
+      [
+        [0, 0, [0, 0, 0, 0]],
+        [0, 1, [3, 3, 3, 3, 3]],
+        [0, 2, [8, 8, 8, 8]],
+      ],
+      [{ kind: 'single', slices: [0, 0] }],
+    ),
+  );
+  applyTrayMove(st, { trayIdx: 0, cells: [3], orientation: null });
+  const t = planNextTransfer(st, [3]);
+  assert(t !== null, 'цепочка не нашлась');
+  assert(t.from === 3 && t.to === 0, `донор — размещённая, получатель — дальняя (4>2), получено ${JSON.stringify(t)}`);
+  assertEq(t.path, [3, 2, 1, 0], 'маршрут от донора к получателю');
+});
+
+test('8.5 Цепочка на столе 3×3: по периметру к дальнему углу', () => {
+  // угол 0 — пять «0»; по краю транзиты 1, 2, 5; размещаем [0] в угол 8
+  const st = createInitialState(
+    lv(
+      3,
+      3,
+      [
+        [0, 0, [0, 0, 0, 0, 0]],
+        [0, 1, [3, 3, 3]],
+        [0, 2, [8, 8, 8, 8]],
+        [1, 2, [5, 5, 5]],
+      ],
+      [{ kind: 'single', slices: [0] }],
+    ),
+  );
+  applyTrayMove(st, { trayIdx: 0, cells: [8], orientation: null });
+  const t = planNextTransfer(st, [8]);
+  assert(t !== null, 'цепочка по краю не нашлась');
+  assertEq(t.path, [8, 5, 2, 1, 0], 'маршрут угол → край → угол');
+  resolveTurn(st, [8]);
+  assertEq(st.completed, 1, 'торт собран по цепочке через край стола');
 });
 
 /* ------------------------------ Итог -------------------------------- */

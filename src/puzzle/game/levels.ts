@@ -1,26 +1,21 @@
 /**
  * Cake Sort — «Кондитерская»
- * Слой 2: доступ к уровням и солвер.
+ * Слой 2: доступ к уровням (итерация 3).
  *
- * Уровни 1–3 — обучающие, заданы вручную в fixed.ts (ТЗ итерации 2, п. 4).
- * С уровня 4 уровни детерминированно генерируются по номеру и проверяются
- * солвером (generator.ts, ТЗ п. 2). Уровней бесконечно много.
+ * Все уровни собирает генератор: стол 3×3, цель в очках, бесконечная
+ * выдача из детерминированного потока. Уровней бесконечно много,
+ * «застрять на нерешаемом» невозможно — материал не кончается.
  */
 
 import type { LevelData } from './types';
-import { FIXED_LEVELS } from './fixed';
-import { generateLevel } from './generator';
+import { buildLevel } from './generator';
 
-export { solve } from './solver';
-export type { SolveMove } from './solver';
-export { FIXED_LEVELS } from './fixed';
+export { buildLevel, levelConfig, targetFor, peekStream, topUpTray, LEVEL_ROWS, LEVEL_COLS } from './generator';
 
 /**
  * Уровень по 0-индексу (движок хранит levelIdx, сейв — level-1).
- * Индексы 0–2 — фиксированные, далее генерация по номеру levelIdx + 1.
+ * getLevel(i) === buildLevel(i + 1); генерация мгновенная, без кеша.
  */
 export function getLevel(index: number): LevelData {
-  const i = Math.max(0, Math.floor(index));
-  if (i < FIXED_LEVELS.length) return FIXED_LEVELS[i];
-  return generateLevel(i + 1);
+  return buildLevel(Math.max(0, Math.floor(index)) + 1);
 }
