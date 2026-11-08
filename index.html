@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Cake Sort — Кондитерская</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;700;800&family=Playfair+Display:wght@600;700;800&display=swap&subset=cyrillic,latin"
+      rel="stylesheet"
+    />
+    <style>
+      html, body {
+        margin: 0; width: 100%; height: 100%; overflow: hidden;
+        background: #161009; font-family: 'Nunito', system-ui, sans-serif;
+        touch-action: none; user-select: none; -webkit-user-select: none;
+      }
+      #app { width: 100%; height: 100%; }
+      .vignette {
+        position: fixed; inset: 0; pointer-events: none; z-index: 2;
+        background: radial-gradient(ellipse at 50% 42%, rgba(0,0,0,0) 46%, rgba(8,5,2,0.55) 100%);
+      }
+      .panel {
+        position: fixed; z-index: 10; background: rgba(24, 18, 11, 0.82);
+        border: 1px solid rgba(212, 175, 55, 0.38); border-radius: 16px; color: #f0e2c4;
+        backdrop-filter: blur(8px); box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+      }
+      #hud { top: 14px; left: 14px; padding: 10px 18px; display: flex; flex-direction: column; gap: 2px; }
+      #level { font-family: 'Playfair Display', Georgia, serif; font-weight: 700; font-size: 21px; color: #e8c96a; }
+      #moves { font-size: 13.5px; font-weight: 700; color: #cdbb96; }
+      #coins { font-size: 13.5px; font-weight: 700; color: #ffe9a8; }
+      #coins b { color: #ffdf8e; }
+      #dotsWrap { top: 14px; left: 50%; transform: translateX(-50%); padding: 12px 18px; display: flex; gap: 8px; }
+      .dot { width: 15px; height: 15px; border-radius: 50%; border: 1.5px solid rgba(212,175,55,0.6); transition: all 0.25s ease; }
+      .dot.on {
+        background: radial-gradient(circle at 35% 30%, #ffe9a8, #d4af37); border-color: #e8c96a;
+        box-shadow: 0 0 10px rgba(232, 201, 106, 0.65);
+      }
+      #tools { top: 14px; right: 14px; padding: 7px; display: flex; gap: 6px; }
+      #tools button {
+        width: 52px; height: 52px; border: 1px solid rgba(255, 236, 180, 0.75); border-radius: 14px; font-size: 23px;
+        background: linear-gradient(145deg, #f0d387, #c39a35); color: #241a08; cursor: pointer;
+        box-shadow: 0 4px 0 rgba(120, 88, 20, 0.55), inset 0 1px 2px rgba(255,255,255,0.5);
+        transition: transform 0.08s ease;
+      }
+      #tools button:active { transform: scale(0.92); }
+      #toast {
+        position: fixed; top: 84px; left: 50%; transform: translateX(-50%) translateY(-8px); z-index: 20;
+        padding: 11px 20px; border-radius: 12px; background: rgba(16, 11, 5, 0.92);
+        border: 1px solid rgba(212,175,55,0.45); color: #f0dfae; font-weight: 700; font-size: 14.5px;
+        opacity: 0; pointer-events: none; transition: all 0.22s ease; white-space: nowrap;
+      }
+      #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+      #overlay {
+        position: fixed; inset: 0; z-index: 30; background: rgba(8, 5, 2, 0.62); display: none;
+        align-items: center; justify-content: center; backdrop-filter: blur(3px);
+      }
+      #overlay.show { display: flex; }
+      #card {
+        background: linear-gradient(160deg, #241a0e, #171008); border: 1.5px solid rgba(212, 175, 55, 0.65);
+        border-radius: 24px; padding: 34px 40px; text-align: center; max-width: 340px; color: #f0e2c4;
+        box-shadow: 0 24px 60px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,235,170,0.18);
+      }
+      #ovTitle { font-family: 'Playfair Display', Georgia, serif; font-size: 30px; margin: 0 0 10px; color: #e8c96a; font-weight: 800; }
+      #ovText { margin: 0 0 22px; font-size: 15.5px; line-height: 1.5; color: #d8c9a5; white-space: pre-line; font-weight: 600; }
+      #ovBtn {
+        border: 1px solid rgba(255, 236, 180, 0.8); border-radius: 14px; padding: 13px 30px; font-size: 17px; font-weight: 800;
+        background: linear-gradient(145deg, #f0d387, #c39a35); color: #241a08; cursor: pointer; font-family: 'Nunito', sans-serif;
+        box-shadow: 0 4px 0 rgba(120, 88, 20, 0.55), inset 0 1px 2px rgba(255,255,255,0.5);
+      }
+      @media (max-width: 640px) {
+        #level { font-size: 18px; }
+        #dotsWrap { display: none; }
+        #hud { padding: 8px 14px; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div class="vignette"></div>
+    <div id="hud" class="panel"><span id="level">Уровень 1</span><span id="moves">Ходов: 0</span><span id="coins">🪙 <b id="coinsNum">30</b></span></div>
+    <div id="dotsWrap" class="panel"><span id="dots" style="display:flex;gap:8px"></span></div>
+    <div id="tools" class="panel">
+      <button id="hint" title="Подсказка (−15 🪙)">💡</button>
+      <button id="restart" title="Заново">🔄</button>
+    </div>
+    <div id="toast"></div>
+    <div id="overlay">
+      <div id="card">
+        <div id="ovTitle"></div>
+        <div id="ovText"></div>
+        <button id="ovBtn"></button>
+      </div>
+    </div>
+    <script type="module" src="/src/puzzle/main.ts"></script>
+  </body>
+</html>
