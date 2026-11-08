@@ -79,6 +79,10 @@ export interface LevelConfig {
   doubles: boolean;
   /** редкие «почти торты» (5 кусочков одного вкуса) */
   heavy: boolean;
+  /** макс. дальность цепочки в «прыжках» (Этап B, аудит §6.3):
+   *  Infinity — обучение (длинные эффектные цепочки),
+   *  2 — один транзит: головоломка «прокладывания маршрута» */
+  maxChainHops: number;
   /** сид потока */
   seed: number;
 }
@@ -88,10 +92,17 @@ export interface LevelConfig {
  *  растёт за счёт цели и состава тарелок, а не числа вкусов. */
 export const MAX_POOL = 6;
 
-/** Цель уровня в очках: мягкий рост с насыщением */
+/** Цель уровня в очках: мягкий рост с насыщением.
+ *  Этап B: кривая сохранена — калибровка (scripts/tune-targets.ts)
+ *  показала, что при согласованной оценке (подсказка играет правилами
+ *  уровня) жадный берёт цель на всех уровнях, а случайный выигрывает
+ *  ~43% — коридор аудита §8.2 выполняется без перенастройки. */
 export function targetFor(n: number): number {
   return Math.min(1200, 250 + 60 * (n - 1));
 }
+
+/** Обучающие уровни: цепочки без ограничения дальности (аудит §6.3) */
+export const TRAINING_LEVELS = 5;
 
 /** Конфиг уровня по 1-номеру n */
 export function levelConfig(n: number): LevelConfig {
@@ -125,6 +136,9 @@ export function levelConfig(n: number): LevelConfig {
     initialCount: N <= 2 ? 2 : 3,
     doubles: N >= 3,
     heavy: N >= 4,
+    // Этап B: обучение на длинных цепочках, дальше — два прыжка (один
+    // транзит); порог совпадает с выходом пула вкусов на максимум (6)
+    maxChainHops: N <= TRAINING_LEVELS ? Infinity : 2,
     seed: hash2(N, 0x51ed270b),
   };
 }
@@ -245,6 +259,8 @@ export function buildLevel(n: number): LevelData {
     target: cfg.target,
     unlockFlavor: cfg.unlockFlavor,
     stream,
+    // Этап B: конфигурация цепной реакции уровня (дальность цепочки)
+    cascade: { maxChainHops: cfg.maxChainHops },
   };
 }
 

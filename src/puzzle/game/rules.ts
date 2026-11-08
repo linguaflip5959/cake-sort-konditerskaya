@@ -10,6 +10,8 @@ import {
   CAP,
   WINDOW,
   cloneTrayItem,
+  DEFAULT_CASCADE_CONFIG,
+  type CascadeConfig,
   type CellIndex,
   type EndReason,
   type Flavor,
@@ -18,6 +20,7 @@ import {
   type LevelData,
   type Orientation,
   type Transfer,
+  type TurnEvent,
 } from './types';
 
 /* ------------------------------------------------------------------ */
@@ -160,23 +163,31 @@ export function chooseRecipient(
  * Тарелка start сама может быть и получателем (тогда донор — найденная
  * тарелка, маршрут разворачивается). Полные тарелки не пропускают
  * кусочки через себя, но сами отдавать могут.
+ *
+ * Этап B: maxHops ограничивает дальность маршрута (1 — только прямые
+ * соседи, 2 — один транзит; Infinity — без ограничения, как до Этапа B).
+ * Кандидаты на глубине ≤ maxHops принимаются, глубже BFS не расширяется
+ * (семантика H-вариантов аудита §5).
  */
 function planChainFrom(
   state: GState,
   start: CellIndex,
   flavor: Flavor,
   lastPlaced: readonly CellIndex[] | null,
+  maxHops: number = Infinity,
 ): Transfer | null {
   const { cols, rows, board } = state;
   const startPlate = board[start];
   if (!startPlate || flavorCount(startPlate, flavor) === 0) return null;
 
   const parent = new Map<CellIndex, CellIndex>();
+  const depth = new Map<CellIndex, number>([[start, 0]]);
   const visited = new Set<CellIndex>([start]);
   const queue: CellIndex[] = [start];
 
   for (let qi = 0; qi < queue.length; qi++) {
     const cell = queue[qi];
+    const d = depth.get(cell)!;
     const plate = board[cell];
     if (!plate) continue;
     const hasFlavor = flavorCount(plate, flavor) > 0;
@@ -207,10 +218,12 @@ function planChainFrom(
     // транзит — только через тарелки со свободным местом; сама start
     // может быть полна: она конец маршрута, а не транзит
     if (cell !== start && space === 0) continue;
+    if (d >= maxHops) continue; // глубже не расширяем (кандидаты до maxHops включительно)
     for (const nb of neighborCells(cols, rows, cell)) {
       if (!visited.has(nb) && board[nb]) {
         visited.add(nb);
         parent.set(nb, cell);
+        depth.set(nb, d + 1);
         queue.push(nb);
       }
     }
@@ -218,42 +231,64 @@ function planChainFrom(
   return null;
 }
 
+/** Конфиг цепной реакции состояния (или умолчание) */
+function cascadeOf(state: GState, cfg?: CascadeConfig): CascadeConfig {
+  return cfg ?? state.cascade ?? DEFAULT_CASCADE_CONFIG;
+}
+
 /**
  * Следующий атомарный перенос или null. Детерминированный порядок (ТЗ 5.6):
  * сначала прямые переносы между соседями — ячейки по строкам, пары
- * «вправо, вниз», вкусы по возрастанию; затем цепочки — та же порядок
+ * «вправо, вниз», вкусы по возрастанию; затем цепочки — тот же порядок
  * обхода, маршрут кратчайший (BFS). Одинаковый вход всегда даёт
  * одинаковый результат.
+ *
+ * Этап B (аудит §6.2–6.3): конфиг задаёт, искать ли цепочки
+ * (allowChainTransfers), максимальную дальность маршрута в «прыжках»
+ * (maxChainHops: 1 — только прямые, 2 — один транзит) и приоритет
+ * прямых переносов (directTransferPriority). Умолчание воспроизводит
+ * поведение до Этапа B.
  */
-export function planNextTransfer(state: GState, lastPlaced: readonly CellIndex[] | null): Transfer | null {
+export function planNextTransfer(
+  state: GState,
+  lastPlaced: readonly CellIndex[] | null,
+  cfg?: CascadeConfig,
+): Transfer | null {
+  const config = cascadeOf(state, cfg);
   const { rows, cols, board } = state;
-  for (let cell = 0; cell < board.length; cell++) {
-    const p = board[cell];
-    if (!p) continue;
-    const right = cell % cols < cols - 1 ? cell + 1 : -1;
-    const down = cell + cols < rows * cols ? cell + cols : -1;
-    for (const nb of [right, down]) {
-      if (nb < 0) continue;
-      const q = board[nb];
-      if (!q) continue;
-      for (const f of sharedFlavors(p, q)) {
-        const recipient = chooseRecipient(state, cell, nb, f, lastPlaced);
-        const donorCell = recipient === cell ? nb : cell;
-        const donor = board[donorCell];
-        const recv = board[recipient];
-        if (!donor || !recv) continue;
-        const space = CAP - recv.slices.length;
-        const count = Math.min(space, flavorCount(donor, f));
-        if (count > 0) return { from: donorCell, to: recipient, flavor: f, count, path: [donorCell, recipient] };
+  // прямые переносы — отдельным проходом, если приоритет включён или
+  // цепочки запрещены (иначе прямых соседей находит и цепочный проход)
+  if (config.directTransferPriority || !config.allowChainTransfers) {
+    for (let cell = 0; cell < board.length; cell++) {
+      const p = board[cell];
+      if (!p) continue;
+      const right = cell % cols < cols - 1 ? cell + 1 : -1;
+      const down = cell + cols < rows * cols ? cell + cols : -1;
+      for (const nb of [right, down]) {
+        if (nb < 0) continue;
+        const q = board[nb];
+        if (!q) continue;
+        for (const f of sharedFlavors(p, q)) {
+          const recipient = chooseRecipient(state, cell, nb, f, lastPlaced);
+          const donorCell = recipient === cell ? nb : cell;
+          const donor = board[donorCell];
+          const recv = board[recipient];
+          if (!donor || !recv) continue;
+          const space = CAP - recv.slices.length;
+          const count = Math.min(space, flavorCount(donor, f));
+          if (count > 0) return { from: donorCell, to: recipient, flavor: f, count, path: [donorCell, recipient] };
+        }
       }
     }
   }
-  // цепочки: несоседние тарелки, связанные маршрутом через свободные места
+  if (!config.allowChainTransfers) return null;
+  // цепочки: несоседние тарелки, связанные маршрутом через свободные места;
+  // глубина BFS ограничена maxChainHops (кандидаты на глубине ≤ maxChainHops)
   for (let cell = 0; cell < board.length; cell++) {
     const p = board[cell];
     if (!p) continue;
     for (const f of distinctFlavors(p)) {
-      const chain = planChainFrom(state, cell, f, lastPlaced);
+      const chain = planChainFrom(state, cell, f, lastPlaced, config.maxChainHops);
       if (chain) return chain;
     }
   }
@@ -402,30 +437,108 @@ export function legalMoves(state: GState): Move[] {
 /* ------------------------------------------------------------------ */
 
 /**
- * Полное разрешение хода (ТЗ 5.5): завершение полной тарелки → перенос →
- * торт → повтор, пока есть допустимые переносы. lastPlaced — ячейки,
- * размещённые в текущем ходе (одна или две, ТЗ итерации 2 п. 3.6).
- * Гарантированно завершается: каждый перенос обнуляет вкус у донора.
- * Возвращает счётчики для эвристики подсказки.
+ * Полное разрешение хода с журналом событий (Этап B, аудит §6.1).
+ *
+ * Схема фаз ТЗ 3.3: размещение уже выполнено (applyTrayMove) — сюда
+ * передаются его ячейки lastPlaced. Дальше: проверка сборки → поиск
+ * совпадений → перенос → торт → очистка → повторная оценка — до
+ * стабилизации поля или срабатывания защитного лимита. Состояние
+ * применяется полностью и независимо от анимаций (ТЗ 3.7); журнал —
+ * контракт для визуального слоя, подсказки и симулятора.
+ *
+ * Завершимость: каждый перенос обнуляет вкус у донора, поэтому число
+ * тарелок с данным вкусом монотонно падает (аудит §2.4). Доказанный
+ * максимум — 54 шага; maxResolutionSteps — страховка (аудит §6.2):
+ * при срабатывании обработка завершается безопасно — без удаления
+ * тарелок и кусочков, состояние консистентно, в журнал пишется
+ * событие aborted со снимком поля для диагностики.
  */
-export function resolveTurn(state: GState, lastPlaced: readonly CellIndex[]): { transfers: number; cakes: number } {
+export function resolveTurnLogged(
+  state: GState,
+  lastPlaced: readonly CellIndex[],
+  cfg?: CascadeConfig,
+): TurnEvent[] {
+  const config = cascadeOf(state, cfg);
+  const log: TurnEvent[] = [{ kind: 'place', cells: [...lastPlaced] }];
+  let steps = 0;
   let transfers = 0;
   let cakes = 0;
-  const done0 = findCompletion(state);
-  if (done0) {
-    applyCompletion(state, done0.cell);
-    cakes++;
-  }
-  for (;;) {
-    const t = planNextTransfer(state, lastPlaced);
-    if (!t) break;
-    applyTransfer(state, t);
-    transfers++;
+
+  /** Проверка сборки (фаза bake): событие cake с комбо и очками */
+  const bakeIfCompleted = (): void => {
+    log.push({ kind: 'phase', phase: 'bake' });
     const done = findCompletion(state);
     if (done) {
       applyCompletion(state, done.cell);
       cakes++;
+      steps++;
+      log.push({
+        kind: 'cake',
+        cell: done.cell,
+        flavor: done.flavor,
+        combo: state.combo,
+        points: CAKE_POINTS + COMBO_BONUS * (state.combo - 1),
+      });
     }
+  };
+
+  // торт мог собраться самим размещением (шесть одинаковых на тарелке)
+  bakeIfCompleted();
+
+  for (;;) {
+    if (steps >= config.maxResolutionSteps) {
+      log.push({
+        kind: 'aborted',
+        steps,
+        limit: config.maxResolutionSteps,
+        snapshot: JSON.stringify({
+          board: state.board.map((p) => (p ? p.slices.map((s) => s.flavor) : null)),
+          points: state.points,
+          combo: state.combo,
+        }),
+      });
+      break;
+    }
+    if (transfers >= config.maxTransfersPerTurn) break;
+    if (cakes >= config.maxCakesPerTurn) break;
+
+    log.push({ kind: 'phase', phase: 'detect' });
+    const t = planNextTransfer(state, lastPlaced, config);
+    if (!t) break;
+
+    log.push({ kind: 'phase', phase: 'move' });
+    log.push({ kind: 'transfer', transfer: t });
+    applyTransfer(state, t);
+    transfers++;
+    steps++;
+
+    // очистка (фаза cleanup): опустевший донор покидает поле сразу —
+    // ячейка доступна следующим фазам того же хода
+    if (!state.board[t.from]) {
+      log.push({ kind: 'phase', phase: 'cleanup' });
+      log.push({ kind: 'plateGone', cell: t.from });
+    }
+
+    bakeIfCompleted();
+    log.push({ kind: 'phase', phase: 'recheck' });
+  }
+
+  log.push({ kind: 'phase', phase: 'done' });
+  return log;
+}
+
+/**
+ * Полное разрешение хода (ТЗ 5.5): делегирует resolveTurnLogged — одна
+ * реализация, эквивалентность по построению (аудит §6.1). Возвращает
+ * счётчики для эвристики подсказки.
+ */
+export function resolveTurn(state: GState, lastPlaced: readonly CellIndex[]): { transfers: number; cakes: number } {
+  const log = resolveTurnLogged(state, lastPlaced);
+  let transfers = 0;
+  let cakes = 0;
+  for (const ev of log) {
+    if (ev.kind === 'transfer') transfers++;
+    else if (ev.kind === 'cake') cakes++;
   }
   return { transfers, cakes };
 }
@@ -483,6 +596,7 @@ export function createInitialState(level: LevelData): GState {
     points: 0,
     target: level.target ?? 0,
     combo: 0,
+    cascade: level.cascade ? { ...DEFAULT_CASCADE_CONFIG, ...level.cascade } : undefined,
     nextPlateId: 1,
     nextSliceId: 1,
   };
@@ -510,6 +624,7 @@ export function cloneState(s: GState): GState {
     points: s.points,
     target: s.target,
     combo: s.combo,
+    cascade: s.cascade ? { ...s.cascade } : undefined,
     nextPlateId: s.nextPlateId,
     nextSliceId: s.nextSliceId,
   };

@@ -31,19 +31,14 @@ import {
 import { PuzzleSfx } from './sfx';
 import {
   adjacentFreePairs,
-  applyCompletion,
   applyTrayMove,
-  applyTransfer,
   bestMove,
-  CAKE_POINTS,
   canPlace,
   canPlaceDoubleAt,
-  COMBO_BONUS,
   createInitialState,
   evalEnd,
-  findCompletion,
   freeCells,
-  planNextTransfer,
+  resolveTurnLogged,
   type Move,
 } from './game/rules';
 import { getLevel, topUpTray, levelConfig } from './game/levels';
@@ -59,6 +54,7 @@ import {
   type Phase,
   type Transfer,
   type TrayItem,
+  type TurnEvent,
 } from './game/types';
 
 /* ------------------------------------------------------------------ */
@@ -1044,43 +1040,66 @@ export class PuzzleEngine {
   }
 
   /**
-   * Автоматическая сортировка (ТЗ 5.5): перенос → торт → повтор.
-   * Данные применяются до анимации; анимация отражает уже изменённое
-   * состояние. Ввод заблокирован до завершения (ТЗ 4.4).
+   * Автоматическая сортировка (ТЗ 5.5, Этап B — аудит §6.1, §6.4):
+   * игровое состояние полностью рассчитывает resolveTurnLogged — журнал
+   * событий, — а визуальный слой воспроизводит его «волнами»: события,
+   * не пересекающиеся по тарелкам, анимируются одновременно (раньше —
+   * строго по одному). Анимация не определяет логику (ТЗ 3.7); ввод
+   * заблокирован до завершения (ТЗ 4.4).
    */
   private async runResolution(lastPlaced: readonly CellIndex[]): Promise<void> {
     this.phase = 'resolving';
     const gen = this.gen;
 
-    const done0 = findCompletion(this.state);
-    if (done0) {
-      applyCompletion(this.state, done0.cell);
-      await this.playCake(done0.cell, done0.flavor);
-      if (gen !== this.gen || this.disposed) return;
-    }
+    const events = resolveTurnLogged(this.state, lastPlaced);
 
-    for (;;) {
-      const t = planNextTransfer(this.state, lastPlaced);
-      if (!t) break;
-      applyTransfer(this.state, t);
-      await this.playTransfer(t);
-      if (gen !== this.gen || this.disposed) return;
-      if (!this.state.board[t.from]) this.discardPlateView(this.plateViews.get(t.from)!);
-      const done = findCompletion(this.state);
-      if (done) {
-        applyCompletion(this.state, done.cell);
-        await this.playCake(done.cell, done.flavor);
-        if (gen !== this.gen || this.disposed) return;
+    // группировка в волны: общая тарелка у событий — разные волны
+    const waves: TurnEvent[][] = [];
+    let wave: TurnEvent[] = [];
+    let busy = new Set<CellIndex>();
+    for (const ev of events) {
+      if (ev.kind === 'phase' || ev.kind === 'place' || ev.kind === 'aborted') continue;
+      const cells = ev.kind === 'transfer' ? ev.transfer.path : [ev.cell];
+      if (cells.some((c) => busy.has(c))) {
+        waves.push(wave);
+        wave = [];
+        busy = new Set<CellIndex>();
       }
+      wave.push(ev);
+      for (const c of cells) busy.add(c);
+    }
+    if (wave.length > 0) waves.push(wave);
+
+    for (const w of waves) {
+      if (gen !== this.gen || this.disposed) return;
+      await Promise.all(w.map((ev) => this.playEvent(ev)));
     }
 
+    // короткий сигнал «стол успокоился» перед возвратом управления (аудит §6.4)
+    await pzDelay(0.12);
+    if (gen !== this.gen || this.disposed) return;
     this.finishTurn();
+  }
+
+  /** Воспроизвести одно событие журнала */
+  private async playEvent(ev: TurnEvent): Promise<void> {
+    if (this.disposed) return;
+    if (ev.kind === 'transfer') {
+      await this.playTransfer(ev.transfer);
+    } else if (ev.kind === 'cake') {
+      await this.playCake(ev);
+    } else if (ev.kind === 'plateGone') {
+      const view = this.plateViews.get(ev.cell);
+      if (view) this.discardPlateView(view);
+      await pzDelay(0.08);
+    }
   }
 
   /**
    * Перелёт кусочков по маршруту: соседним тарелкам — напрямую, дальше —
-   * цепочкой, с приземлением на каждой промежуточной тарелке и искрами
-   * на «транзитах» (правило соседних тарелок).
+   * цепочкой, с приземлением на каждой промежуточной тарелке, искрами
+   * на «транзитах» и золотым контуром получателя (правило соседних
+   * тарелок; аудит §6.4 — усилить контуром получателя).
    */
   private async playTransfer(t: Transfer): Promise<void> {
     const fromView = this.plateViews.get(t.from);
@@ -1105,6 +1124,9 @@ export class PuzzleEngine {
     const segDur = chain ? 0.26 : 0.42;
     const stagger = chain ? 0.11 : 0.07;
     const segs = t.path.length - 1;
+
+    // цепочка: подсвечиваем получателя до начала полёта — видно, куда летят кусочки
+    if (chain) this.flashRing(toView.pos.x, toView.pos.z);
 
     // мировые опорные точки маршрута (тарелки могли исчезнуть — берём ячейку)
     const hops: Array<{ x: number; z: number }> = t.path.map((c) => {
@@ -1156,17 +1178,53 @@ export class PuzzleEngine {
 
   /* --------------------------- Сборка торта --------------------------- */
 
-  /** Шесть одинаковых кусочков: торт с короной летит на подставку (ТЗ 5.7, 8.3.7–8).
- *  Очки за торт (с комбо-бонусом) всплывают над ячейкой (итерация 3). */
-  private async playCake(cell: CellIndex, flavor: Flavor): Promise<void> {
-    // applyCompletion уже начислил очки и поднял комбо — повторяем расчёт для всплывашки
-    const combo = Math.max(1, this.state.combo);
-    const gained = CAKE_POINTS + COMBO_BONUS * (combo - 1);
+  /**
+   * Золотой контур получателя цепочки: расширяющееся кольцо, гаснет
+   * за время полёта кусочков (аудит §6.4).
+   */
+  private flashRing(x: number, z: number): void {
+    if (this.disposed) return;
+    const ring = new THREE.Mesh(
+      new THREE.TorusGeometry(PLATE_RADIUS * 1.08, 0.042, 8, 40),
+      new THREE.MeshBasicMaterial({ color: 0xffd97a, transparent: true, opacity: 0.95 }),
+    );
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.set(x, 0.07, z);
+    this.scene.add(ring);
+    gsap.fromTo(
+      ring.scale,
+      { x: 0.55, y: 0.55, z: 1 },
+      { x: 1.3, y: 1.3, z: 1, duration: 0.5, ease: 'power2.out' },
+    );
+    gsap.to(ring.material, {
+      opacity: 0,
+      duration: 0.55,
+      ease: 'power1.out',
+      onComplete: () => {
+        ring.geometry.dispose();
+        (ring.material as THREE.Material).dispose();
+        ring.removeFromParent();
+      },
+    });
+  }
+
+  /**
+   * Шесть одинаковых кусочков: торт с короной летит на подставку
+   * (ТЗ 5.7, 8.3.7–8). Очки и комбо — из события журнала (логика уже
+   * применена). Серию «торт за тортом» ускоряем: ~2.35 → 1.6 → 1.1 с
+   * на каждый следующий торт хода (аудит §6.4).
+   */
+  private async playCake(ev: { cell: CellIndex; flavor: Flavor; combo: number; points: number }): Promise<void> {
+    const { cell, flavor } = ev;
+    const combo = Math.max(1, ev.combo);
+    const gained = ev.points;
+    // темп серии: первый торт — полностью, второй — 0.68, дальше — 0.47
+    const s = combo === 1 ? 1 : combo === 2 ? 0.68 : 0.47;
     const screen = this.screenPosCell(cell);
     if (this.ui.onCakeScore) this.ui.onCakeScore(screen.x, screen.y, flavor, gained, combo);
     const view = this.plateViews.get(cell);
     if (!view) {
-      await pzDelay(0.2);
+      await pzDelay(0.2 * s);
       return;
     }
     this.plateViews.delete(cell);
@@ -1177,11 +1235,11 @@ export class PuzzleEngine {
 
     // 1) «Утряска»: лесенка выравнивается в ровный круг + лёгкий пульс
     meshes.forEach((m, i) => {
-      gsap.to(m.position, { y: SLOT_Y, duration: 0.26, delay: i * 0.02, ease: 'power2.inOut' });
+      gsap.to(m.position, { y: SLOT_Y, duration: 0.26 * s, delay: i * 0.02 * s, ease: 'power2.inOut' });
       gsap.fromTo(
         m.scale,
         { x: 1, y: 1, z: 1 },
-        { x: 1.07, y: 1.07, z: 1.07, duration: 0.13, delay: 0.1 + i * 0.02, yoyo: true, repeat: 1, ease: 'sine.inOut' },
+        { x: 1.07, y: 1.07, z: 1.07, duration: 0.13 * s, delay: (0.1 + i * 0.02) * s, yoyo: true, repeat: 1, ease: 'sine.inOut' },
       );
     });
 
@@ -1189,7 +1247,7 @@ export class PuzzleEngine {
     this.discardPlateView(view);
 
     // 2) Торт получает корону, взлетает и летит на подставку
-    gsap.delayedCall(0.55, () => {
+    gsap.delayedCall(0.55 * s, () => {
       if (gen !== this.gen || this.disposed) return;
 
       const cake = new THREE.Group();
@@ -1216,24 +1274,24 @@ export class PuzzleEngine {
       });
 
       // взлёт + оборот
-      tl.to(cake.position, { y: 1.2, duration: 0.32, ease: 'back.out(1.8)' });
-      tl.to(cake.rotation, { y: Math.PI * 2, duration: 0.55, ease: 'power1.inOut' }, '<');
+      tl.to(cake.position, { y: 1.2, duration: 0.32 * s, ease: 'back.out(1.8)' });
+      tl.to(cake.rotation, { y: Math.PI * 2, duration: 0.55 * s, ease: 'power1.inOut' }, '<');
       // полёт на золотую подставку
       tl.to(cake.position, {
         x: 0,
         z: this.layout.standZ,
         y: STAND_CAKE_Y + 0.5,
-        duration: 0.6,
+        duration: 0.6 * s,
         ease: 'power1.inOut',
       });
-      tl.to(cake.position, { y: STAND_CAKE_Y, duration: 0.16, ease: 'power1.out' }, '<+=0.6');
+      tl.to(cake.position, { y: STAND_CAKE_Y, duration: 0.16 * s, ease: 'power1.out' }, `<+=${0.6 * s}`);
       tl.call(() => this.burst(0, STAND_CAKE_Y + 0.4, this.layout.standZ, combo > 1 ? 20 : 12, 0xffd97a));
-      tl.to(cake.scale, { x: 0.01, y: 0.01, z: 0.01, duration: 0.28, ease: 'back.in(1.6)' }, '+=0.4');
-      tl.to(cake.position, { y: STAND_CAKE_Y + 0.55, duration: 0.28, ease: 'power1.in' }, '<');
+      tl.to(cake.scale, { x: 0.01, y: 0.01, z: 0.01, duration: 0.28 * s, ease: 'back.in(1.6)' }, `+=${0.4 * s}`);
+      tl.to(cake.position, { y: STAND_CAKE_Y + 0.55, duration: 0.28 * s, ease: 'power1.in' }, '<');
     });
 
-    // утряска 0.55 + полёт ~1.9
-    await pzDelay(2.35);
+    // утряска + полёт (масштабируется темпом серии)
+    await pzDelay(2.35 * s);
   }
 
   /* ------------------------ Конец хода/уровня ------------------------- */

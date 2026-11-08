@@ -102,6 +102,8 @@ export interface LevelData {
   unlockFlavor?: number;
   /** бесконечный поток тарелок */
   stream?: TrayStream;
+  /** конфигурация цепной реакции (Этап B): переопределения над умолчанием */
+  cascade?: Partial<CascadeConfig>;
 }
 
 /** Тарелка на поле */
@@ -129,6 +131,8 @@ export interface GState {
   target: number;
   /** торты, собранные в текущем ходе (для комбо-бонуса) */
   combo: number;
+  /** конфигурация цепной реакции уровня (Этап B); отсутствует — по умолчанию */
+  cascade?: CascadeConfig;
   nextPlateId: number;
   nextSliceId: number;
 }
@@ -148,3 +152,59 @@ export interface Transfer {
 
 /** Причина поражения: поле заполнено (некуда ставить) или очередь кончилась с остатком (ТЗ п. 6.3) */
 export type EndReason = 'full' | 'leftover';
+
+/* ------------------------------------------------------------------ */
+/* Конфигурация цепной реакции (Этап B, аудит §6.2)                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Параметры разрешения хода. Значения по умолчанию воспроизводят
+ * поведение до Этапа B; лимиты переносов и тортов — защита на будущее,
+ * а не инструмент балансировки (аудит §5: лимит тортов порождает патологию
+ * «шесть кусочков, но торт не собирается», лимит переносов неотличим).
+ */
+export interface CascadeConfig {
+  /** защитный лимит шагов разрешения за ход (шаг = перенос или торт).
+   *  Доказанный максимум — 54 (9 тарелок × 6 вкусов), запас — 64. */
+  maxResolutionSteps: number;
+  /** лимит переносов за ход; Infinity — отключено */
+  maxTransfersPerTurn: number;
+  /** лимит тортов за ход; Infinity — отключено */
+  maxCakesPerTurn: number;
+  /** цепочечные переносы разрешены (V3 аудита: выключение ломает игру 2/30) */
+  allowChainTransfers: boolean;
+  /** макс. число «прыжков» маршрута: 1 — только прямые соседи,
+   *  2 — один транзит, Infinity — без ограничения (аудит §5, H-варианты) */
+  maxChainHops: number;
+  /** прямые переносы раньше цепочек (уже реализовано до Этапа B) */
+  directTransferPriority: boolean;
+}
+
+/** Конфиг по умолчанию: текущие правила без ограничений + защитный лимит */
+export const DEFAULT_CASCADE_CONFIG: CascadeConfig = {
+  maxResolutionSteps: 64,
+  maxTransfersPerTurn: Infinity,
+  maxCakesPerTurn: Infinity,
+  allowChainTransfers: true,
+  maxChainHops: Infinity,
+  directTransferPriority: true,
+};
+
+/* ------------------------------------------------------------------ */
+/* Журнал событий хода (Этап B, аудит §6.1)                            */
+/* ------------------------------------------------------------------ */
+
+/** Фазы разрешения хода (ТЗ 3.3): контракт для визуального слоя */
+export type TurnPhase = 'detect' | 'move' | 'bake' | 'cleanup' | 'recheck' | 'done';
+
+/**
+ * Одно событие разрешения хода. Логика применяет состояние полностью и
+ * независимо от анимаций (ТЗ 3.7); визуальный слой воспроизводит журнал.
+ */
+export type TurnEvent =
+  | { kind: 'place'; cells: CellIndex[] }
+  | { kind: 'transfer'; transfer: Transfer }
+  | { kind: 'cake'; cell: CellIndex; flavor: Flavor; combo: number; points: number }
+  | { kind: 'plateGone'; cell: CellIndex }
+  | { kind: 'aborted'; steps: number; limit: number; snapshot: string }
+  | { kind: 'phase'; phase: TurnPhase };

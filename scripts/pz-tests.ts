@@ -8,24 +8,41 @@
 
 import {
   applyCompletion,
+  applyTransfer,
   applyTrayMove,
   bestMove,
   CAKE_POINTS,
   canPlace,
   canPlaceDoubleAt,
   chooseRecipient,
+  cloneState,
   COMBO_BONUS,
   createInitialState,
   evalEnd,
+  findCompletion,
   legalMoves,
   MERGE_POINTS,
   planNextTransfer,
   resolveTurn,
+  resolveTurnLogged,
   sharedAdjacency,
+  type Move,
 } from '../src/puzzle/game/rules';
-import { buildLevel, levelConfig, peekStream, targetFor, topUpTray } from '../src/puzzle/game/generator';
+import { buildLevel, levelConfig, peekStream, targetFor, topUpTray, TRAINING_LEVELS } from '../src/puzzle/game/generator';
 import { getLevel } from '../src/puzzle/game/levels';
-import { CAP, FLAVOR_COUNT, TRAY_BUFFER, WINDOW, trayFlavors, type Flavor, type LevelData, type TrayItem } from '../src/puzzle/game/types';
+import {
+  CAP,
+  DEFAULT_CASCADE_CONFIG,
+  FLAVOR_COUNT,
+  TRAY_BUFFER,
+  WINDOW,
+  trayFlavors,
+  type CascadeConfig,
+  type Flavor,
+  type LevelData,
+  type TrayItem,
+  type TurnEvent,
+} from '../src/puzzle/game/types';
 
 /* --------------------------- мини-фреймворк ------------------------- */
 
@@ -664,6 +681,420 @@ test('8.5 Цепочка на столе 3×3: по периметру к дал
   assertEq(t.path, [8, 5, 2, 1, 0], 'маршрут угол → край → угол');
   resolveTurn(st, [8]);
   assertEq(st.completed, 1, 'торт собран по цепочке через край стола');
+});
+
+/* ------- 9. Этап B: каскад, журнал событий, maxChainHops (аудит §6.5) -- */
+
+/** Ссылочная реализация разрешения хода ДО Этапа B (копия старого resolveTurn):
+ *  журнал обязан быть ей эквивалентен на умолчательном конфиге. */
+function referenceResolveTurn(state: Parameters<typeof resolveTurn>[0], lastPlaced: readonly number[]): { transfers: number; cakes: number } {
+  let transfers = 0;
+  let cakes = 0;
+  const done0 = findCompletion(state);
+  if (done0) {
+    applyCompletion(state, done0.cell);
+    cakes++;
+  }
+  for (;;) {
+    const t = planNextTransfer(state, lastPlaced);
+    if (!t) break;
+    applyTransfer(state, t);
+    transfers++;
+    const done = findCompletion(state);
+    if (done) {
+      applyCompletion(state, done.cell);
+      cakes++;
+    }
+  }
+  return { transfers, cakes };
+}
+
+function fingerprint(s: ReturnType<typeof createInitialState>): string {
+  return JSON.stringify({
+    board: s.board.map((p) => (p ? p.slices.map((x) => x.flavor) : null)),
+    points: s.points,
+    completed: s.completed,
+    combo: s.combo,
+  });
+}
+
+/** Конфиг с заданной дальностью цепочки (остальное — умолчание) */
+function hopsCfg(hops: number): CascadeConfig {
+  return { ...DEFAULT_CASCADE_CONFIG, maxChainHops: hops };
+}
+
+test('9.1 Эквивалентность журнала и старого алгоритма на уровнях 1–12, обе стратегии', () => {
+  for (let n = 1; n <= 12; n++) {
+    // отдельные объекты уровня на партию: stream.next общий мутируется topUpTray
+    const levelA = buildLevel(n);
+    const levelB = buildLevel(n);
+    const a = createInitialState(levelA);
+    const b = createInitialState(levelB);
+    // жадный
+    for (let m = 0; m < 12; m++) {
+      const mv = bestMove(a);
+      const mv2 = bestMove(b);
+      if (!mv || !mv2) break;
+      applyTrayMove(a, mv);
+      applyTrayMove(b, mv2);
+      resolveTurnLogged(a, mv.cells);
+      referenceResolveTurn(b, mv2.cells);
+      topUpTray(levelA, a);
+      topUpTray(levelB, b);
+    }
+    assertEq(fingerprint(a), fingerprint(b), `жадный, уровень ${n}: состояние разошлось`);
+    // случайный (детерминированный)
+    let seed = n * 7717;
+    const rnd = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+    const levelC = buildLevel(n);
+    const levelD = buildLevel(n);
+    const c = createInitialState(levelC);
+    const d = createInitialState(levelD);
+    for (let m = 0; m < 14; m++) {
+      const moves = legalMoves(c);
+      if (moves.length === 0) break;
+      const mv = moves[Math.floor(rnd() * moves.length)];
+      const mvB = { ...mv };
+      applyTrayMove(c, mv);
+      applyTrayMove(d, mvB);
+      resolveTurnLogged(c, mv.cells);
+      referenceResolveTurn(d, mvB.cells);
+      topUpTray(levelC, c);
+      topUpTray(levelD, d);
+    }
+    assertEq(fingerprint(c), fingerprint(d), `случайный, уровень ${n}: состояние разошлось`);
+  }
+});
+
+test('9.2 Детерминизм журнала: одинаковый вход — одинаковый журнал', () => {
+  const levelA = buildLevel(7);
+  const levelB = buildLevel(7);
+  for (let m = 0; m < 5; m++) {
+    const a = createInitialState(levelA);
+    const b = createInitialState(levelB);
+    const mva = bestMove(a);
+    const mvb = bestMove(b);
+    if (!mva || !mvb) break;
+    applyTrayMove(a, mva);
+    applyTrayMove(b, mvb);
+    const la = resolveTurnLogged(a, mva.cells);
+    const lb = resolveTurnLogged(b, mvb.cells);
+    assertEq(JSON.stringify(la), JSON.stringify(lb), `ход ${m}: журналы различаются`);
+    topUpTray(levelA, a);
+    topUpTray(levelB, b);
+  }
+});
+
+test('9.3 maxChainHops = 1/2/3/∞: перенос через заданное число транзитов', () => {
+  // ряд 0..3: маршрут [0,1,2,3] — 3 прыжка (2 транзита), углы и край поля
+  const mk = () =>
+    createInitialState(
+      lv(
+        1,
+        4,
+        [
+          [0, 0, [0, 0]],
+          [0, 1, [3, 3, 3, 3, 3]],
+          [0, 2, [8, 8, 8, 8]],
+        ],
+        [{ kind: 'single', slices: [0, 0, 0, 0] }],
+      ),
+    );
+  for (const [hops, expectNull] of [
+    [1, true],
+    [2, true],
+    [3, false],
+    [Infinity, false],
+  ] as Array<[number, boolean]>) {
+    const st = mk();
+    applyTrayMove(st, { trayIdx: 0, cells: [3], orientation: null });
+    const t = planNextTransfer(st, [3], hopsCfg(hops));
+    if (expectNull) {
+      assert(t === null, `hops=${hops}: перенос не должен находиться`);
+    } else {
+      assert(t !== null, `hops=${hops}: перенос должен находиться`);
+      assertEq(t!.path, [0, 1, 2, 3], `hops=${hops}: маршрут из 3 прыжков`);
+    }
+  }
+  // 3×3 по периметру: [8,5,2,1,0] — 4 прыжка, дальний угол через край
+  const mk9 = () =>
+    createInitialState(
+      lv(
+        3,
+        3,
+        [
+          [0, 0, [0, 0, 0, 0, 0]],
+          [0, 1, [3, 3, 3]],
+          [0, 2, [8, 8, 8, 8]],
+          [1, 2, [5, 5, 5]],
+        ],
+        [{ kind: 'single', slices: [0] }],
+      ),
+    );
+  for (const [hops, expectNull] of [
+    [1, true],
+    [2, true],
+    [3, true],
+    [4, false],
+  ] as Array<[number, boolean]>) {
+    const st = mk9();
+    applyTrayMove(st, { trayIdx: 0, cells: [8], orientation: null });
+    const t = planNextTransfer(st, [8], hopsCfg(hops));
+    if (expectNull) {
+      assert(t === null, `3×3, hops=${hops}: перенос через полстола не должен находиться`);
+    } else {
+      assert(t !== null && t.path.length === 5, `3×3, hops=${hops}: маршрут угол→угол`);
+    }
+  }
+});
+
+test('9.4 Транзит — только через тарелку со свободным местом (при всех hops)', () => {
+  for (const hops of [1, 2, 3, Infinity]) {
+    const st = createInitialState(
+      lv(
+        1,
+        4,
+        [
+          [0, 0, [0, 0]],
+          [0, 1, [3, 3, 3, 4, 4, 4]], // полный транзит — блокирует единственный маршрут
+          [0, 2, [8, 8, 8, 8]],
+        ],
+        [{ kind: 'single', slices: [0, 0, 0, 0] }],
+      ),
+    );
+    applyTrayMove(st, { trayIdx: 0, cells: [3], orientation: null });
+    assert(planNextTransfer(st, [3], hopsCfg(hops)) === null, `hops=${hops}: полный транзит должен блокировать`);
+  }
+});
+
+test('9.5 maxResolutionSteps: безопасная остановка, состояние консистентно', () => {
+  // уровень 7 (дальше обучения): играем с искусственно заниженным лимитом
+  const level = buildLevel(7);
+  const st = createInitialState(level);
+  let aborted = 0;
+  for (let m = 0; m < 12; m++) {
+    const mv = bestMove(st);
+    if (!mv) break;
+    applyTrayMove(st, mv);
+    const log = resolveTurnLogged(st, mv.cells, { ...DEFAULT_CASCADE_CONFIG, maxResolutionSteps: 2 });
+    const ab = log.find((e) => e.kind === 'aborted');
+    if (ab && ab.kind === 'aborted') {
+      aborted++;
+      assertEq(ab.limit, 2, 'лимит в событии aborted');
+      const snap = JSON.parse(ab.snapshot) as { board: Array<number[] | null>; points: number };
+      assertEq(snap.board.length, 9, 'снимок поля — 9 ячеек');
+      assert(typeof snap.points === 'number', 'снимок содержит очки');
+    }
+    // консистентность: вместимость не нарушена, тарелки не пустые
+    for (const p of st.board) {
+      if (!p) continue;
+      assert(p.slices.length >= 1 && p.slices.length <= CAP, `ход ${m}: тарелка из ${p.slices.length} кусочков`);
+    }
+    topUpTray(level, st);
+    const end = evalEnd(st);
+    // игра не блокируется: исход — законный (продолжение или честный конец)
+    assert(end.phase === 'playing' || end.phase === 'won' || end.phase === 'lost', `ход ${m}: неожиданный исход`);
+    if (end.phase !== 'playing') break;
+  }
+  assert(aborted > 0, 'заниженный лимит должен срабатывать хотя бы раз');
+  // нормальный лимит никогда не срабатывает на реальных уровнях
+  const st2 = createInitialState(buildLevel(13));
+  for (let m = 0; m < 10; m++) {
+    const mv = bestMove(st2);
+    if (!mv) break;
+    applyTrayMove(st2, mv);
+    const log = resolveTurnLogged(st2, mv.cells);
+    assert(log.every((e) => e.kind !== 'aborted'), `ход ${m}: ложное срабатывание защитного лимита`);
+    topUpTray(buildLevel(13), st2);
+  }
+});
+
+test('9.6 Освобождение донора в том же ходу: ячейка доступна следующим фазам', () => {
+  const st = createInitialState(
+    lv(
+      3,
+      3,
+      [
+        [0, 0, [1, 1]],
+        [0, 1, [1, 1, 1, 1]],
+        [1, 0, [2, 2]],
+        [1, 1, [2, 2, 2, 2]],
+      ],
+      [{ kind: 'single', slices: [7] }],
+    ),
+  );
+  applyTrayMove(st, { trayIdx: 0, cells: [8], orientation: null });
+  const log = resolveTurnLogged(st, [8]);
+  const kinds = log.map((e) => e.kind);
+  assert(kinds.includes('plateGone'), 'должен быть plateGone');
+  assert(kinds.filter((k) => k === 'cake').length >= 2, 'оба торта должны собраться в одном ходу');
+  // порядок: plateGone первой пары — до торта/переноса второй пары
+  const gone1 = log.findIndex((e) => e.kind === 'plateGone' && e.cell === 0);
+  const t2 = log.findIndex((e) => e.kind === 'transfer' && (e.transfer.from === 3 || e.transfer.to === 3));
+  assert(gone1 >= 0 && t2 >= 0 && gone1 < t2, 'очистка первой пары должна предшествовать переносу второй');
+  // освобождённые ячейки доступны и учитываются
+  assert(canPlace(st, 0), 'ячейка 0 свободна после хода');
+  assert(canPlace(st, 1), 'ячейка 1 свободна после хода');
+  assertEq(st.board.filter(Boolean).length, 1, 'на поле осталась одна тарелка ([7] в углу)');
+});
+
+test('9.7 Комбо: растёт внутри хода, сбрасывается новым ходом, формула очков', () => {
+  const level = lv(
+    3,
+    3,
+    [
+      [0, 0, [1, 1]],
+      [0, 1, [1, 1, 1, 1]],
+      [1, 0, [2, 2]],
+      [1, 1, [2, 2, 2, 2]],
+      [2, 0, [7, 7, 7, 7, 7]],
+    ],
+    [
+      { kind: 'single', slices: [7] },
+      { kind: 'single', slices: [9, 9] },
+    ],
+  );
+  const st = createInitialState(level);
+  // размещаем [7] рядом с пятёркой (ячейка 7 соседствует с 6) — прямой перенос
+  applyTrayMove(st, { trayIdx: 0, cells: [7], orientation: null });
+  const log = resolveTurnLogged(st, [7]);
+  const cakes = log.filter((e): e is Extract<TurnEvent, { kind: 'cake' }> => e.kind === 'cake');
+  assert(cakes.length === 3, `должно собраться 3 торта, собралось ${cakes.length}`);
+  assertEq(cakes.map((c) => c.combo), [1, 2, 3], 'комбо растёт внутри хода');
+  assertEq(cakes.map((c) => c.points), [100, 125, 150], 'очки: 100 + 25 за каждый следующий');
+  // переносы: 2 кусочка вкуса 1, 2 кусочка вкуса 2, 1 кусочек вкуса 7
+  const expected = 100 + 125 + 150 + MERGE_POINTS * 5;
+  assertEq(st.points, expected, 'итоговые очки хода');
+  assertEq(st.combo, 3, 'счётчик комбо после хода');
+  // новый ход: размещение без слияний сбрасывает комбо (applyTrayMove)
+  applyTrayMove(st, { trayIdx: 0, cells: [5], orientation: null });
+  assertEq(st.combo, 0, 'начало хода сбрасывает комбо');
+  resolveTurnLogged(st, [5]);
+  assertEq(st.combo, 0, 'ход без тортов не меняет комбо');
+});
+
+test('9.8 Победа по очкам: последний торт хода засчитывается до evalEnd', () => {
+  const target = 210;
+  const level = lv(
+    3,
+    3,
+    [
+      [0, 0, [1, 1]],
+      [0, 1, [1, 1, 1, 1]],
+      [1, 0, [2, 2]],
+      [1, 1, [2, 2, 2, 2]],
+    ],
+    [{ kind: 'single', slices: [7] }],
+    target,
+  );
+  const st = createInitialState(level);
+  applyTrayMove(st, { trayIdx: 0, cells: [8], orientation: null });
+  const log = resolveTurnLogged(st, [8]);
+  const cakes = log.filter((e): e is Extract<TurnEvent, { kind: 'cake' }> => e.kind === 'cake');
+  assert(cakes.length === 2, 'два торта за ход');
+  // очки до последнего торта были ниже цели, после — выше
+  const first = cakes[0].points + MERGE_POINTS * 4; // 4 кусочка первого переноса
+  assert(first < target, `после первого торта (${first}) цель ещё не взята`);
+  assert(st.points >= target, `после последнего торта (${st.points}) цель взята`);
+  assertEq(evalEnd(st), { phase: 'won' }, 'победа фиксируется сразу после хода');
+});
+
+test('9.9 Двойная тарелка: обе ячейки в журнале, приоритет получателя', () => {
+  const st = createInitialState(
+    lv(
+      3,
+      3,
+      [[1, 1, [0, 0]]],
+      [{ kind: 'double', a: [0, 0], b: [4, 4] }],
+    ),
+  );
+  applyTrayMove(st, { trayIdx: 0, cells: [3, 6], orientation: 1 });
+  const log = resolveTurnLogged(st, [3, 6]);
+  const place = log[0];
+  assert(place.kind === 'place', 'первое событие — place');
+  if (place.kind === 'place') assertEq(place.cells, [3, 6], 'обе ячейки двойной в журнале');
+  const tr = log.find((e): e is Extract<TurnEvent, { kind: 'transfer' }> => e.kind === 'transfer');
+  assert(tr !== undefined, 'перенос должен произойти');
+  // равное число кусочков (2 и 2) → получатель — размещённая в этом ходу
+  assertEq(tr!.transfer.to, 3, 'получатель — размещённая половинка (приоритет lastPlaced)');
+  assertEq(tr!.transfer.from, 4, 'донор — тарелка с центра');
+});
+
+test('9.10 Прогрессия maxChainHops из конфига уровня читается и применяется', () => {
+  // обучение: без ограничения
+  for (let n = 1; n <= TRAINING_LEVELS; n++) {
+    assertEq(levelConfig(n).maxChainHops, Infinity, `уровень ${n}: обучение без ограничения`);
+    assertEq(buildLevel(n).cascade?.maxChainHops, Infinity, `уровень ${n}: каскад уровня`);
+  }
+  // дальше: два прыжка
+  for (const n of [TRAINING_LEVELS + 1, 10, 25, 40]) {
+    assertEq(levelConfig(n).maxChainHops, 2, `уровень ${n}: два прыжка`);
+    const level = buildLevel(n);
+    assertEq(level.cascade?.maxChainHops, 2, `уровень ${n}: каскад уровня`);
+    const st = createInitialState(level);
+    assertEq(st.cascade?.maxChainHops, 2, `уровень ${n}: каскад в состоянии`);
+  }
+  // функционально: длинная цепочка на «пост-обучающем» уровне не работает
+  const restricted = lv(
+    1,
+    4,
+    [
+      [0, 0, [0, 0]],
+      [0, 1, [3, 3, 3, 3, 3]],
+      [0, 2, [8, 8, 8, 8]],
+    ],
+    [{ kind: 'single', slices: [0, 0, 0, 0] }],
+  );
+  restricted.cascade = { maxChainHops: 2 };
+  const stR = createInitialState(restricted);
+  applyTrayMove(stR, { trayIdx: 0, cells: [3], orientation: null });
+  assert(planNextTransfer(stR, [3]) === null, 'цепочка в 3 прыжка запрещена конфигом уровня');
+  // тот же уровень без ограничения — цепочка работает (∞ ведёт себя как раньше)
+  const free = lv(
+    1,
+    4,
+    [
+      [0, 0, [0, 0]],
+      [0, 1, [3, 3, 3, 3, 3]],
+      [0, 2, [8, 8, 8, 8]],
+    ],
+    [{ kind: 'single', slices: [0, 0, 0, 0] }],
+  );
+  free.cascade = { maxChainHops: Infinity };
+  const stF = createInitialState(free);
+  applyTrayMove(stF, { trayIdx: 0, cells: [3], orientation: null });
+  assert(planNextTransfer(stF, [3]) !== null, 'без ограничения цепочка работает как до Этапа B');
+});
+
+test('9.11 Прочие поля CascadeConfig: отключение цепочек, лимиты (конфиг выживает)', () => {
+  // allowChainTransfers = false — остаются только прямые переносы
+  const st = createInitialState(
+    lv(
+      1,
+      4,
+      [
+        [0, 0, [0, 0]],
+        [0, 1, [3, 3, 3, 3, 3]],
+        [0, 2, [8, 8, 8, 8]],
+      ],
+      [{ kind: 'single', slices: [0, 0, 0, 0] }],
+    ),
+  );
+  applyTrayMove(st, { trayIdx: 0, cells: [3], orientation: null });
+  assert(
+    planNextTransfer(st, [3], { ...DEFAULT_CASCADE_CONFIG, allowChainTransfers: false }) === null,
+    'без цепочек дальний перенос запрещён',
+  );
+  // maxTransfersPerTurn = 0 — разрешения нет вовсе (структура из ТЗ 3.5)
+  const st3 = createInitialState(
+    lv(2, 2, [[0, 0, [1, 1]], [0, 1, [1, 1, 1, 1]]], [{ kind: 'single', slices: [7] }]),
+  );
+  applyTrayMove(st3, { trayIdx: 0, cells: [3], orientation: null });
+  const log = resolveTurnLogged(st3, [3], { ...DEFAULT_CASCADE_CONFIG, maxTransfersPerTurn: 0 });
+  assert(log.every((e) => e.kind !== 'transfer'), 'лимит переносов = 0 запрещает переносы');
 });
 
 /* ------------------------------ Итог -------------------------------- */
