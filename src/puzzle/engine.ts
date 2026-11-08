@@ -19,27 +19,44 @@ import {
   buildPlate,
   buildCenterStand,
   buildSquareTable,
+  buildDoubleBridge,
   goldMaterial,
   sparkMaterial,
   STAND_CAKE_Y,
   SLICE_HEIGHT,
   PLATE_RADIUS,
   type SliceMesh,
+  type BridgeMesh,
 } from './cakes';
 import { PuzzleSfx } from './sfx';
 import {
+  adjacentFreePairs,
   applyCompletion,
+  applyTrayMove,
   applyTransfer,
   canPlace,
+  canPlaceDoubleAt,
   cloneState,
+  createInitialState,
   evalEnd,
   findCompletion,
   freeCells,
   planNextTransfer,
-  placePlate,
+  totalCakes,
+  type Move,
 } from './game/rules';
-import { createInitialState, getLevel, solve, totalCakes } from './game/levels';
-import type { CellIndex, EndReason, Flavor, GState, LevelData, Phase } from './game/types';
+import { getLevel, solve } from './game/levels';
+import {
+  cloneTrayItem,
+  type CellIndex,
+  type EndReason,
+  type Flavor,
+  type GState,
+  type LevelData,
+  type Orientation,
+  type Phase,
+  type TrayItem,
+} from './game/types';
 
 /* ------------------------------------------------------------------ */
 /* Типы                                                                */
@@ -50,6 +67,8 @@ export interface PuzzleStats {
   moves: number;
   collected: number;
   cakes: number;
+  /** есть ли двойная тарелка в видимом окне очереди (кнопка поворота) */
+  doubleInTray: boolean;
 }
 
 export interface PuzzleUI {
@@ -67,6 +86,27 @@ interface PlateView {
   cell: number;
   /** индекс в очереди 0..2; -1 после размещения */
   trayIdx: number;
+  pos: THREE.Vector3;
+}
+
+/** Вид элемента очереди (ТЗ итерации 2, п. 3.2): обычная или двойная тарелка */
+interface TrayView {
+  trayIdx: number;
+  item: TrayItem;
+  /** ориентация двойной тарелки (ТЗ п. 3.4) */
+  orientation: Orientation;
+  /** вид обычной тарелки */
+  single: PlateView | null;
+  /** составной вид двойной тарелки */
+  double: {
+    group: THREE.Group;
+    a: PlateView;
+    b: PlateView;
+    bridge: BridgeMesh;
+    /** накопленный угол поворота (кратен π/2) */
+    rotY: number;
+  } | null;
+  /** позиция слота очереди (центр) */
   pos: THREE.Vector3;
 }
 
@@ -97,6 +137,12 @@ const TRAY_Y = -0.45;
 const SECTOR = Math.PI / 3;
 /** Радиус захвата свободной ячейки при перетаскивании */
 const SNAP_DIST = CELL * 0.55;
+/** Масштаб двойной тарелки в слоте очереди — миниатюра (ТЗ п. 3.8) */
+const DOUBLE_QUEUE_SCALE = 0.58;
+/** Масштаб двойной тарелки при перетаскивании */
+const DOUBLE_DRAG_SCALE = 0.85;
+/** Радиус захвата пары ячеек при перетаскивании двойной */
+const PAIR_SNAP_DIST = CELL * 0.85;
 
 /** Угол слота i: кусочек №0 «смотрит» на игрока, дальше — по кругу */
 function slotAngle(i: number): number {
@@ -168,8 +214,8 @@ export class PuzzleEngine {
 
   /** тарелки на поле: ячейка → вид */
   private plateViews = new Map<CellIndex, PlateView>();
-  /** видимые тарелки очереди, отсортированы по trayIdx */
-  private trayItems: PlateView[] = [];
+  /** видимые элементы очереди, отсортированы по trayIdx */
+  private trayViews: TrayView[] = [];
   /** тарелки, растворяющиеся после сборки торта/переноса */
   private dyingPlates: PlateView[] = [];
   /** Летящие на подставку торты */
@@ -178,8 +224,8 @@ export class PuzzleEngine {
   private gen = 0;
 
   /** активное перетаскивание */
-  private drag: { view: PlateView; pointerId: number; targetCell: CellIndex | null } | null = null;
-  private highlightCell: CellIndex | null = null;
+  private drag: { tv: TrayView; pointerId: number; target: Move | null; x: number; y: number } | null = null;
+  private highlightCells: CellIndex[] | null = null;
 
   /** метки ячеек поля */
   private cellRings: Array<{ mesh: THREE.Mesh; mat: THREE.MeshBasicMaterial }> = [];
@@ -291,8 +337,9 @@ export class PuzzleEngine {
       pts.push(new THREE.Vector3(p.x, 2.25, p.z));
     }
     for (const s of l.slotPositions) {
-      pts.push(new THREE.Vector3(s.x - pad, TRAY_Y, s.z + pad));
-      pts.push(new THREE.Vector3(s.x + pad, TRAY_Y, s.z + pad));
+      const slotPad = pad + 0.35; // двойная тарелка шире обычной
+      pts.push(new THREE.Vector3(s.x - slotPad, TRAY_Y, s.z + slotPad));
+      pts.push(new THREE.Vector3(s.x + slotPad, TRAY_Y, s.z + slotPad));
       pts.push(new THREE.Vector3(s.x, DRAG_Y, s.z));
     }
     pts.push(new THREE.Vector3(-1.15, 0, l.standZ - 1.15));
@@ -309,6 +356,15 @@ export class PuzzleEngine {
     const h = this.container.clientHeight || window.innerHeight;
     const aspect = Math.max(0.3, w / h);
     this.camera.aspect = aspect;
+
+    // На узких экранах кнопки занимают верхний правый угол — поле должно
+    // помещаться ниже них (ТЗ итерации 2, п. 5.2)
+    let topLimit = 0.8;
+    if (aspect < 0.85) {
+      const tools = document.getElementById('tools');
+      const reservePx = tools ? THREE.MathUtils.clamp(tools.getBoundingClientRect().bottom + 14, 96, 320) : 96;
+      topLimit = THREE.MathUtils.clamp(1 - (2 * reservePx) / h, 0.34, 0.8);
+    }
 
     const elev = this.camElev;
     let cz = 0;
@@ -330,7 +386,7 @@ export class PuzzleEngine {
       }
 
       cz -= (top - bot) * dist * 0.06;
-      const need = Math.max(top / 0.8, bot / 0.88, side / 0.92);
+      const need = Math.max(top / topLimit, bot / 0.88, side / 0.92);
       dist *= THREE.MathUtils.clamp(need, 0.8, 1.25);
       if (Math.abs(need - 1) < 0.006 && Math.abs(top - bot) < 0.012) break;
     }
@@ -362,10 +418,10 @@ export class PuzzleEngine {
 
   private clearBoard(): void {
     for (const v of this.plateViews.values()) this.killView(v);
-    for (const v of this.trayItems) this.killView(v);
+    for (const v of this.trayViews) this.killTrayView(v);
     for (const v of this.dyingPlates) this.killView(v);
     this.plateViews.clear();
-    this.trayItems = [];
+    this.trayViews = [];
     this.dyingPlates = [];
     this.drag = null;
     this.setHighlight(null);
@@ -442,9 +498,9 @@ export class PuzzleEngine {
       spawnDelay += 0.07;
     }
 
-    // очередь: первые три тарелки
+    // очередь: первые три элемента
     for (let i = 0; i < Math.min(3, this.state.tray.length); i++) {
-      this.spawnTrayItem(i, 0.3 + i * 0.09);
+      this.spawnTrayView(i, 0.3 + i * 0.09);
     }
 
     this.frameLevel();
@@ -530,32 +586,82 @@ export class PuzzleEngine {
     return { group, slices, cell: -1, trayIdx: -1, pos: new THREE.Vector3() };
   }
 
-  private spawnTrayItem(trayIdx: number, delay = 0): PlateView {
-    const flavors = this.state.tray[trayIdx] ?? [];
-    const view = this.makePlateView(flavors);
-    view.trayIdx = trayIdx;
-    const pos = this.layout.slotPositions[trayIdx];
-    view.pos.copy(pos);
-    view.group.position.copy(pos);
-    view.group.scale.setScalar(0.01);
-    this.scene.add(view.group);
-    gsap.to(view.group.scale, { x: 1, y: 1, z: 1, duration: 0.34, ease: 'back.out(1.9)', delay });
-    this.trayItems.push(view);
-    this.trayItems.sort((a, b) => a.trayIdx - b.trayIdx);
-    return view;
+  /** Группа элемента очереди (обычная тарелка или составная двойная) */
+  private trayGroup(tv: TrayView): THREE.Group {
+    return tv.single ? tv.single.group : tv.double!.group;
   }
 
-  /** После размещения: оставшиеся тарелки сдвигаются, справа новая */
-  private refreshTray(): void {
-    this.trayItems.forEach((it, i) => {
-      it.trayIdx = i;
-      const target = this.layout.slotPositions[i];
-      it.pos.copy(target);
-      gsap.to(it.group.position, { x: target.x, z: target.z, duration: 0.3, ease: 'power2.inOut', overwrite: 'auto' });
-    });
-    if (this.state.tray.length > this.trayItems.length) {
-      this.spawnTrayItem(this.trayItems.length, 0.16);
+  private killTrayView(tv: TrayView): void {
+    if (tv.single) {
+      this.killView(tv.single);
+    } else if (tv.double) {
+      const d = tv.double;
+      gsap.killTweensOf(d.group.position);
+      gsap.killTweensOf(d.group.scale);
+      gsap.killTweensOf(d.group.rotation);
+      this.killView(d.a);
+      this.killView(d.b);
+      d.bridge.material.dispose();
+      d.group.removeFromParent();
     }
+  }
+
+  private spawnTrayView(trayIdx: number, delay = 0): TrayView {
+    const item = this.state.tray[trayIdx];
+    const pos = this.layout.slotPositions[trayIdx];
+    const tv: TrayView = { trayIdx, item, orientation: 0, single: null, double: null, pos: pos.clone() };
+    if (item.kind === 'single') {
+      const view = this.makePlateView(item.slices);
+      view.trayIdx = trayIdx;
+      tv.single = view;
+      view.group.position.copy(pos);
+      view.group.scale.setScalar(0.01);
+      this.scene.add(view.group);
+      gsap.to(view.group.scale, { x: 1, y: 1, z: 1, duration: 0.34, ease: 'back.out(1.9)', delay });
+    } else {
+      // двойная тарелка: две тарелки + золотая перемычка, единый объект (ТЗ п. 3.8)
+      const group = new THREE.Group();
+      const a = this.makePlateView(item.a);
+      const b = this.makePlateView(item.b);
+      a.trayIdx = trayIdx;
+      b.trayIdx = trayIdx;
+      a.group.position.set(-CELL / 2, 0, 0);
+      b.group.position.set(CELL / 2, 0, 0);
+      group.add(a.group, b.group);
+      const bridge = buildDoubleBridge();
+      group.add(bridge);
+      group.position.copy(pos);
+      group.rotation.y = 0;
+      group.scale.setScalar(0.01);
+      this.scene.add(group);
+      gsap.to(group.scale, {
+        x: DOUBLE_QUEUE_SCALE,
+        y: DOUBLE_QUEUE_SCALE,
+        z: DOUBLE_QUEUE_SCALE,
+        duration: 0.34,
+        ease: 'back.out(1.9)',
+        delay,
+      });
+      tv.double = { group, a, b, bridge, rotY: 0 };
+    }
+    this.trayViews.push(tv);
+    this.trayViews.sort((x, y) => x.trayIdx - y.trayIdx);
+    return tv;
+  }
+
+  /** После размещения: оставшиеся элементы сдвигаются, справа новый */
+  private refreshTray(): void {
+    this.trayViews.forEach((tv, i) => {
+      tv.trayIdx = i;
+      const target = this.layout.slotPositions[i];
+      tv.pos.copy(target);
+      const g = this.trayGroup(tv);
+      gsap.to(g.position, { x: target.x, z: target.z, duration: 0.3, ease: 'power2.inOut', overwrite: 'auto' });
+    });
+    if (this.state.tray.length > this.trayViews.length) {
+      this.spawnTrayView(this.trayViews.length, 0.16);
+    }
+    this.emitStats();
   }
 
   private discardPlateView(view: PlateView): void {
@@ -601,8 +707,8 @@ export class PuzzleEngine {
     if (this.phase !== 'idle' || this.disposed || this.drag) return;
     const idx = this.pickTraySlot(e.clientX, e.clientY);
     if (idx < 0) return;
-    const view = this.trayItems[idx];
-    this.drag = { view, pointerId: e.pointerId, targetCell: null };
+    const tv = this.trayViews[idx];
+    this.drag = { tv, pointerId: e.pointerId, target: null, x: e.clientX, y: e.clientY };
     this.phase = 'dragging';
     this.sfx.select();
     try {
@@ -610,54 +716,81 @@ export class PuzzleEngine {
     } catch {
       /* стилизованные тесты/странные устройства — не критично */
     }
-    gsap.killTweensOf(view.group.position);
-    gsap.to(view.group.position, { y: DRAG_Y, duration: 0.2, ease: 'power2.out', overwrite: 'auto' });
+    const g = this.trayGroup(tv);
+    gsap.killTweensOf(g.position);
+    gsap.killTweensOf(g.scale);
+    gsap.to(g.position, { y: DRAG_Y, duration: 0.2, ease: 'power2.out', overwrite: 'auto' });
+    if (tv.double) {
+      gsap.to(g.scale, {
+        x: DOUBLE_DRAG_SCALE,
+        y: DOUBLE_DRAG_SCALE,
+        z: DOUBLE_DRAG_SCALE,
+        duration: 0.2,
+        ease: 'power2.out',
+        overwrite: 'auto',
+      });
+    }
     this.updateDragTarget(e.clientX, e.clientY);
   };
 
   private onPointerMove = (e: PointerEvent): void => {
     if (!this.drag || e.pointerId !== this.drag.pointerId) return;
+    this.drag.x = e.clientX;
+    this.drag.y = e.clientY;
     const p = this.pointerToWorld(e.clientX, e.clientY);
     if (p) {
-      this.drag.view.group.position.x = p.x;
-      this.drag.view.group.position.z = p.z;
+      const g = this.trayGroup(this.drag.tv);
+      g.position.x = p.x;
+      g.position.z = p.z;
     }
     this.updateDragTarget(e.clientX, e.clientY);
   };
 
   private onPointerUp = (e: PointerEvent): void => {
     if (!this.drag || e.pointerId !== this.drag.pointerId) return;
-    const { view, targetCell } = this.drag;
+    const tv = this.drag.tv;
     this.drag = null;
-    if (targetCell !== null && canPlace(this.state, targetCell)) {
-      void this.placeFromTray(view, targetCell);
+    const target = this.computeDragTarget(tv, e.clientX, e.clientY);
+    if (target && this.isValidTarget(target)) {
+      void this.placeFromTray(tv, target.cells);
     } else {
-      this.cancelDrag(view);
+      this.cancelDrag(tv);
     }
   };
 
   private onPointerCancel = (e: PointerEvent): void => {
     if (!this.drag || e.pointerId !== this.drag.pointerId) return;
-    const view = this.drag.view;
+    const tv = this.drag.tv;
     this.drag = null;
-    this.cancelDrag(view);
+    this.cancelDrag(tv);
   };
 
-  /** Отпустить тарелку вне поля — плавный возврат в слот очереди (ТЗ 4.2) */
-  private cancelDrag(view: PlateView): void {
+  /** Отпустить тарелку вне поля — плавный возврат в слот очереди без траты хода (ТЗ 4.2, п. 3.3) */
+  private cancelDrag(tv: TrayView): void {
     this.setHighlight(null);
     this.phase = 'idle';
-    gsap.to(view.group.position, {
-      x: view.pos.x,
-      y: view.pos.y,
-      z: view.pos.z,
+    const g = this.trayGroup(tv);
+    gsap.to(g.position, {
+      x: tv.pos.x,
+      y: tv.pos.y,
+      z: tv.pos.z,
       duration: 0.3,
       ease: 'back.out(1.3)',
       overwrite: 'auto',
     });
+    if (tv.double) {
+      gsap.to(g.scale, {
+        x: DOUBLE_QUEUE_SCALE,
+        y: DOUBLE_QUEUE_SCALE,
+        z: DOUBLE_QUEUE_SCALE,
+        duration: 0.3,
+        ease: 'back.out(1.3)',
+        overwrite: 'auto',
+      });
+    }
   }
 
-  /** Тарелка очереди по экранным координатам: ближайший центр в радиусе тарелки */
+  /** Тарелка очереди по экранным координатам: ближайший центр в радиусе предмета */
   private pickTraySlot(clientX: number, clientY: number): number {
     const rect = this.renderer.domElement.getBoundingClientRect();
     const px = clientX - rect.left;
@@ -666,12 +799,15 @@ export class PuzzleEngine {
     let best = -1;
     let bestD = Infinity;
 
-    for (let i = 0; i < this.trayItems.length; i++) {
-      const pos = this.trayItems[i].group.position;
+    for (let i = 0; i < this.trayViews.length; i++) {
+      const tv = this.trayViews[i];
+      const pos = this.trayGroup(tv).position;
+      const halfExtent =
+        tv.item.kind === 'single' ? PLATE_RADIUS : (CELL / 2 + PLATE_RADIUS) * DOUBLE_QUEUE_SCALE;
       v.set(pos.x, TRAY_Y + 0.4, pos.z).project(this.camera);
       const cx = ((v.x + 1) / 2) * rect.width;
       const cy = ((-v.y + 1) / 2) * rect.height;
-      v.set(pos.x + PLATE_RADIUS, TRAY_Y + 0.4, pos.z).project(this.camera);
+      v.set(pos.x + halfExtent, TRAY_Y + 0.4, pos.z).project(this.camera);
       const rx = Math.abs(((v.x + 1) / 2) * rect.width - cx);
       const limit = Math.max(rx * 1.3, 30);
       const d = Math.hypot(px - cx, py - cy);
@@ -695,58 +831,98 @@ export class PuzzleEngine {
     return this.raycaster.ray.intersectPlane(this.dragPlane, out) ? out : null;
   }
 
-  /** Ближайшая свободная ячейка под тарелкой + подсветка (ТЗ 4.1.3–4) */
-  private updateDragTarget(clientX: number, clientY: number): void {
-    if (!this.drag) return;
+  /** Цель перетаскивания: свободная ячейка или пара ячеек под указателем (ТЗ 4.1.3–4, п. 3.3) */
+  private computeDragTarget(tv: TrayView, clientX: number, clientY: number): Move | null {
     const p = this.pointerToWorld(clientX, clientY);
-    let found: CellIndex | null = null;
-    if (p) {
+    if (!p) return null;
+    if (tv.item.kind === 'single') {
+      let best: CellIndex | null = null;
       let bestD = SNAP_DIST * SNAP_DIST;
       for (const cell of freeCells(this.state)) {
         const cp = this.layout.cellPositions[cell];
         const d = (cp.x - p.x) ** 2 + (cp.z - p.z) ** 2;
         if (d < bestD) {
           bestD = d;
-          found = cell;
+          best = cell;
         }
       }
+      return best === null ? null : { trayIdx: tv.trayIdx, cells: [best], orientation: null };
     }
-    if (found !== this.drag.targetCell) {
-      this.drag.targetCell = found;
-      this.setHighlight(found);
+    // двойная тарелка: пары, соответствующие текущей ориентации (ТЗ п. 3.4)
+    const horiz = tv.orientation === 0 || tv.orientation === 2;
+    let bestCells: [CellIndex, CellIndex] | null = null;
+    let bestD = PAIR_SNAP_DIST * PAIR_SNAP_DIST;
+    for (const pair of adjacentFreePairs(this.state)) {
+      if (pair.horiz !== horiz) continue;
+      const pa = this.layout.cellPositions[pair.a];
+      const pb = this.layout.cellPositions[pair.b];
+      const mx = (pa.x + pb.x) / 2;
+      const mz = (pa.z + pb.z) / 2;
+      const d = (mx - p.x) ** 2 + (mz - p.z) ** 2;
+      if (d < bestD) {
+        bestD = d;
+        bestCells = [pair.a, pair.b];
+      }
+    }
+    if (!bestCells) return null;
+    // ориентации 2 и 3 — половинки меняются местами
+    const swapped = tv.orientation === 2 || tv.orientation === 3;
+    const cells: [CellIndex, CellIndex] = swapped ? [bestCells[1], bestCells[0]] : bestCells;
+    return { trayIdx: tv.trayIdx, cells, orientation: tv.orientation };
+  }
+
+  private isValidTarget(mv: Move): boolean {
+    if (mv.cells.length === 1) return canPlace(this.state, mv.cells[0]);
+    return canPlaceDoubleAt(this.state, mv.cells[0], mv.cells[1]);
+  }
+
+  private updateDragTarget(clientX: number, clientY: number): void {
+    if (!this.drag) return;
+    const target = this.computeDragTarget(this.drag.tv, clientX, clientY);
+    const same =
+      (target === null && this.drag.target === null) ||
+      (target !== null && this.drag.target !== null && target.cells.join(',') === this.drag.target.cells.join(','));
+    if (!same) {
+      this.drag.target = target;
+      this.setHighlight(target ? target.cells : null);
     }
   }
 
-  private setHighlight(cell: CellIndex | null): void {
-    if (this.highlightCell !== null) {
-      const prev = this.cellRings[this.highlightCell];
-      if (prev) {
-        gsap.killTweensOf(prev.mesh.scale);
-        gsap.killTweensOf(prev.mat);
-        prev.mesh.scale.setScalar(1);
-        prev.mat.opacity = 0.38;
-        prev.mat.color.setHex(0xd4af37);
+  /** Подсветка целевых ячеек: одна для обычной тарелки, обе — для двойной (ТЗ п. 3.3) */
+  private setHighlight(cells: CellIndex[] | null): void {
+    if (this.highlightCells) {
+      for (const c of this.highlightCells) {
+        const prev = this.cellRings[c];
+        if (prev) {
+          gsap.killTweensOf(prev.mesh.scale);
+          gsap.killTweensOf(prev.mat);
+          prev.mesh.scale.setScalar(1);
+          prev.mat.opacity = 0.38;
+          prev.mat.color.setHex(0xd4af37);
+        }
       }
     }
-    this.highlightCell = cell;
-    if (cell !== null) {
-      const ring = this.cellRings[cell];
-      if (ring) {
-        ring.mat.opacity = 0.95;
-        ring.mat.color.setHex(0xffe9a8);
-        gsap.fromTo(
-          ring.mesh.scale,
-          { x: 1, y: 1, z: 1 },
-          { x: 1.1, y: 1, z: 1.1, duration: 0.4, yoyo: true, repeat: -1, ease: 'sine.inOut' },
-        );
+    this.highlightCells = cells;
+    if (cells) {
+      for (const cell of cells) {
+        const ring = this.cellRings[cell];
+        if (ring) {
+          ring.mat.opacity = 0.95;
+          ring.mat.color.setHex(0xffe9a8);
+          gsap.fromTo(
+            ring.mesh.scale,
+            { x: 1, y: 1, z: 1 },
+            { x: 1.1, y: 1, z: 1.1, duration: 0.4, yoyo: true, repeat: -1, ease: 'sine.inOut' },
+          );
+        }
       }
     }
   }
 
   /* --------------------------- Ходы ----------------------------------- */
 
-  /** Размещение тарелки из очереди на ячейку (ТЗ 4.1.5) */
-  private async placeFromTray(view: PlateView, cell: CellIndex): Promise<void> {
+  /** Размещение элемента очереди: обычной — на ячейку, двойной — на пару (ТЗ 4.1.5, п. 3.3) */
+  private async placeFromTray(tv: TrayView, cells: CellIndex[]): Promise<void> {
     this.setHighlight(null);
     this.phase = 'placing';
     this.moves += 1;
@@ -754,29 +930,72 @@ export class PuzzleEngine {
     this.sfx.place();
 
     // 1) данные — источник истины (ТЗ 9.5)
-    placePlate(this.state, view.trayIdx, cell);
-
-    // 2) вид: тарелка летит в ячейку
-    const gen = this.gen;
-    view.trayIdx = -1;
-    view.cell = cell;
-    view.pos.copy(this.layout.cellPositions[cell]);
-    this.plateViews.set(cell, view);
-    this.trayItems = this.trayItems.filter((it) => it !== view);
-    const target = this.layout.cellPositions[cell];
-    gsap.to(view.group.position, {
-      x: target.x,
-      y: 0,
-      z: target.z,
-      duration: 0.3,
-      ease: 'power2.inOut',
-      overwrite: 'auto',
+    applyTrayMove(this.state, {
+      trayIdx: tv.trayIdx,
+      cells,
+      orientation: tv.item.kind === 'double' ? tv.orientation : null,
     });
+
+    // 2) вид
+    const gen = this.gen;
+    this.trayViews = this.trayViews.filter((v) => v !== tv);
+
+    if (tv.single) {
+      const view = tv.single;
+      view.trayIdx = -1;
+      view.cell = cells[0];
+      view.pos.copy(this.layout.cellPositions[cells[0]]);
+      this.plateViews.set(cells[0], view);
+      const target = this.layout.cellPositions[cells[0]];
+      gsap.to(view.group.position, {
+        x: target.x,
+        y: 0,
+        z: target.z,
+        duration: 0.3,
+        ease: 'power2.inOut',
+        overwrite: 'auto',
+      });
+    } else if (tv.double) {
+      // двойная летит серединой между ячейками, затем разделяется (ТЗ п. 3.8)
+      const d = tv.double;
+      const posA = this.layout.cellPositions[cells[0]];
+      const posB = this.layout.cellPositions[cells[1]];
+      const mid = posA.clone().add(posB).multiplyScalar(0.5);
+      gsap.to(d.group.position, { x: mid.x, y: 0, z: mid.z, duration: 0.32, ease: 'power2.inOut', overwrite: 'auto' });
+      gsap.to(d.group.scale, { x: 1, y: 1, z: 1, duration: 0.32, ease: 'power2.inOut', overwrite: 'auto' });
+      this.plateViews.set(cells[0], d.a);
+      this.plateViews.set(cells[1], d.b);
+    }
+
     this.refreshTray();
 
-    await pzDelay(0.34);
+    await pzDelay(0.36);
     if (gen !== this.gen || this.disposed) return;
-    await this.runResolution(cell);
+
+    if (tv.double) {
+      // разделение: половинки становятся независимыми, перемычка тает (ТЗ п. 3.8)
+      const d = tv.double;
+      d.a.trayIdx = -1;
+      d.b.trayIdx = -1;
+      d.a.cell = cells[0];
+      d.b.cell = cells[1];
+      d.a.pos.copy(this.layout.cellPositions[cells[0]]);
+      d.b.pos.copy(this.layout.cellPositions[cells[1]]);
+      this.scene.attach(d.a.group);
+      this.scene.attach(d.b.group);
+      const bridge = d.bridge;
+      gsap.to(bridge.material, {
+        opacity: 0,
+        duration: 0.25,
+        ease: 'power1.in',
+        onComplete: () => bridge.removeFromParent(),
+      });
+      d.group.removeFromParent();
+      await pzDelay(0.12);
+      if (gen !== this.gen || this.disposed) return;
+    }
+
+    await this.runResolution(cells);
   }
 
   /**
@@ -784,7 +1003,7 @@ export class PuzzleEngine {
    * Данные применяются до анимации; анимация отражает уже изменённое
    * состояние. Ввод заблокирован до завершения (ТЗ 4.4).
    */
-  private async runResolution(lastPlaced: CellIndex): Promise<void> {
+  private async runResolution(lastPlaced: readonly CellIndex[]): Promise<void> {
     this.phase = 'resolving';
     const gen = this.gen;
 
@@ -991,11 +1210,46 @@ export class PuzzleEngine {
     }
   }
 
+  /* --------------------------- Поворот двойной ------------------------ */
+
+  /** Есть ли двойная тарелка в видимом окне очереди (ТЗ п. 3.5) */
+  hasDoubleInTray(): boolean {
+    return this.trayViews.some((tv) => tv.item.kind === 'double');
+  }
+
+  /**
+   * Повернуть двойную тарелку на 90° по часовой стрелке (ТЗ п. 3.5).
+   * Во время перетаскивания поворачивается тарелка в руке, иначе — первая
+   * двойная в видимом окне. Хода не тратит; в фазах placing/resolving
+   * заблокировано. Возвращает true, если поворот выполнен.
+   */
+  rotateDouble(): boolean {
+    if (this.disposed) return false;
+    if (this.phase !== 'idle' && this.phase !== 'dragging') return false;
+    let tv: TrayView | null = null;
+    if (this.drag && this.drag.tv.item.kind === 'double') {
+      tv = this.drag.tv;
+    } else if (this.phase === 'idle') {
+      tv = this.trayViews.find((v) => v.item.kind === 'double') ?? null;
+    }
+    if (!tv || !tv.double) return false;
+    tv.orientation = ((tv.orientation + 1) % 4) as Orientation;
+    tv.double.rotY -= Math.PI / 2;
+    this.sfx.select();
+    gsap.to(tv.double.group.rotation, { y: tv.double.rotY, duration: 0.2, ease: 'power2.inOut', overwrite: 'auto' });
+    if (this.drag && this.drag.tv === tv) {
+      // ориентация изменилась — пересчитать допустимые пары
+      this.updateDragTarget(this.drag.x, this.drag.y);
+    }
+    return true;
+  }
+
   /* --------------------------- Подсказка ------------------------------ */
 
   /**
-   * Подсказка: солвер решает текущее состояние и подсвечивает тарелку
-   * очереди и ячейку первого хода. Возвращает true, если подсказка показана.
+   * Подсказка: солвер решает текущее состояние и подсвечивает элемент
+   * очереди и целевые ячейки первого хода; двойная тарелка показывается
+   * в нужной ориентации (ТЗ п. 3.7). Возвращает true, если показана.
    */
   hint(): boolean {
     if (this.phase !== 'idle' || this.disposed) return false;
@@ -1005,9 +1259,17 @@ export class PuzzleEngine {
     const mv = sol[0];
     this.clearHints();
     const gen = this.gen;
-    const item = this.trayItems.find((it) => it.trayIdx === mv.trayIdx);
-    if (item) this.addHintRing(item.group.position);
-    this.addHintRing(this.layout.cellPositions[mv.cell]);
+    const tv = this.trayViews.find((v) => v.trayIdx === mv.trayIdx);
+    if (tv) {
+      this.addHintRing(this.trayGroup(tv).position);
+      // превью двойной тарелки в нужной ориентации (ТЗ п. 3.7)
+      if (tv.double && mv.orientation !== null) {
+        tv.orientation = mv.orientation;
+        tv.double.rotY = nearAngle(tv.double.rotY, -(mv.orientation * Math.PI) / 2);
+        gsap.to(tv.double.group.rotation, { y: tv.double.rotY, duration: 0.25, ease: 'power2.inOut', overwrite: 'auto' });
+      }
+    }
+    for (const c of mv.cells) this.addHintRing(this.layout.cellPositions[c]);
     gsap.delayedCall(2.7, () => {
       if (this.gen === gen) this.clearHints();
     });
@@ -1049,6 +1311,7 @@ export class PuzzleEngine {
       moves: this.moves,
       collected: this.state.completed,
       cakes: this.targetCakes,
+      doubleInTray: this.hasDoubleInTray(),
     });
   }
 
@@ -1059,7 +1322,7 @@ export class PuzzleEngine {
 
   nextLevel(): void {
     if (this.disposed) return;
-    this.loadLevel(this.levelIdx + 1); // уровни зациклены после последнего
+    this.loadLevel(this.levelIdx + 1); // дальше — бесконечная генерация
   }
 
   start(): void {
@@ -1078,7 +1341,7 @@ export class PuzzleEngine {
     // лёгкое парение тарелки при перетаскивании
     if (this.drag) {
       const bob = Math.sin(t * 3.2) * 0.05;
-      const g = this.drag.view.group;
+      const g = this.trayGroup(this.drag.tv);
       if (!gsap.isTweening(g.position)) g.position.y += (DRAG_Y + bob - g.position.y) * Math.min(1, dt * 8);
     }
 
@@ -1119,10 +1382,10 @@ export class PuzzleEngine {
     };
   }
 
-  /** Экранные координаты тарелки очереди по trayIdx (для e2e-тестов) */
+  /** Экранные координаты элемента очереди по trayIdx (для e2e-тестов) */
   screenPosTray(trayIdx: number): { x: number; y: number } {
-    const item = this.trayItems.find((it) => it.trayIdx === trayIdx);
-    const pos = item ? item.group.position : this.layout.slotPositions[trayIdx];
+    const tv = this.trayViews.find((v) => v.trayIdx === trayIdx);
+    const pos = tv ? this.trayGroup(tv).position : this.layout.slotPositions[trayIdx];
     const v = pos.clone().setY(TRAY_Y + 0.4).project(this.camera);
     const rect = this.renderer.domElement.getBoundingClientRect();
     return {
@@ -1152,9 +1415,11 @@ export class PuzzleEngine {
     collected: number;
     cakes: number;
     free: number;
-    tray: number[][];
+    tray: TrayItem[];
     board: Array<{ cell: number; flavors: number[] }>;
-    highlight: number | null;
+    highlight: number[] | null;
+    doubleInTray: boolean;
+    orientations: number[];
   } {
     return {
       phase: this.phase,
@@ -1162,9 +1427,11 @@ export class PuzzleEngine {
       collected: this.state.completed,
       cakes: this.targetCakes,
       free: freeCells(this.state).length,
-      tray: this.state.tray.map((t) => [...t]),
+      tray: this.state.tray.map(cloneTrayItem),
       board: this.state.board.flatMap((p, cell) => (p ? [{ cell, flavors: p.slices.map((s) => s.flavor) }] : [])),
-      highlight: this.highlightCell,
+      highlight: this.highlightCells ? [...this.highlightCells] : null,
+      doubleInTray: this.hasDoubleInTray(),
+      orientations: this.trayViews.filter((tv) => tv.double).map((tv) => tv.orientation),
     };
   }
 
@@ -1192,9 +1459,14 @@ export class PuzzleEngine {
       if (this.disposed) return;
       await this.waitIdle();
       if (this.phase !== 'idle') return;
-      const item = this.trayItems.find((it) => it.trayIdx === mv.trayIdx);
-      if (!item) return;
-      void this.placeFromTray(item, mv.cell);
+      const tv = this.trayViews.find((v) => v.trayIdx === mv.trayIdx);
+      if (!tv) return;
+      if (tv.double && mv.orientation !== null) {
+        tv.orientation = mv.orientation;
+        tv.double.rotY = -(mv.orientation * Math.PI) / 2;
+        tv.double.group.rotation.y = tv.double.rotY;
+      }
+      void this.placeFromTray(tv, mv.cells);
     }
     await this.waitIdle();
   }

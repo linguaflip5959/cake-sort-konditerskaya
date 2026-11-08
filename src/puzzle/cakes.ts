@@ -219,6 +219,32 @@ export function buildPlate(): THREE.Group {
 }
 
 /* ------------------------------------------------------------------ */
+/* Двойная тарелка: золотая перемычка                                  */
+/* ------------------------------------------------------------------ */
+
+/** Перемычка с собственным материалом — движок растворяет её при разделении */
+export interface BridgeMesh extends THREE.Mesh {
+  material: THREE.MeshStandardMaterial;
+}
+
+/** Золотая перемычка, соединяющая две тарелки двойной (ТЗ итерации 2, п. 3.8) */
+export function buildDoubleBridge(): BridgeMesh {
+  const bridge = new THREE.Mesh(
+    roundedBox(0.82, 0.075, 0.17, 0.03),
+    new THREE.MeshStandardMaterial({
+      color: 0xd4af37,
+      roughness: 0.26,
+      metalness: 1.0,
+      envMapIntensity: 1.35,
+      transparent: true,
+    }),
+  );
+  bridge.position.y = 0.085;
+  bridge.castShadow = true;
+  return bridge as BridgeMesh;
+}
+
+/* ------------------------------------------------------------------ */
 /* Подставка для готовых тортов: мраморный подиум + золотой ярус        */
 /* ------------------------------------------------------------------ */
 

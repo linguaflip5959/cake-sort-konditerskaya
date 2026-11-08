@@ -7,7 +7,6 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: 'index.html', // сортировка «Кондитерская»
-        puzzle: 'puzzle.html', // редирект на index.html (совместимость)
       },
     },
   },

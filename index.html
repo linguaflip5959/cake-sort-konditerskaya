@@ -37,19 +37,22 @@
         background: radial-gradient(circle at 35% 30%, #ffe9a8, #d4af37); border-color: #e8c96a;
         box-shadow: 0 0 10px rgba(232, 201, 106, 0.65);
       }
-      #tools { top: 14px; right: 14px; padding: 7px; display: flex; gap: 6px; }
+      #tools { top: 14px; right: 14px; padding: 8px; display: flex; flex-direction: column; gap: 7px; }
       #tools button {
-        width: 52px; height: 52px; border: 1px solid rgba(255, 236, 180, 0.75); border-radius: 14px; font-size: 23px;
+        min-height: 44px; padding: 9px 16px; border: 1px solid rgba(255, 236, 180, 0.75); border-radius: 13px;
+        font-family: 'Nunito', sans-serif; font-size: 13.5px; font-weight: 800; line-height: 1.18;
         background: linear-gradient(145deg, #f0d387, #c39a35); color: #241a08; cursor: pointer;
         box-shadow: 0 4px 0 rgba(120, 88, 20, 0.55), inset 0 1px 2px rgba(255,255,255,0.5);
-        transition: transform 0.08s ease;
+        transition: transform 0.08s ease; max-width: 158px; white-space: normal;
       }
-      #tools button:active { transform: scale(0.92); }
+      #tools button:active { transform: scale(0.94); }
+      #tools button[hidden] { display: none; }
       #toast {
         position: fixed; top: 84px; left: 50%; transform: translateX(-50%) translateY(-8px); z-index: 20;
         padding: 11px 20px; border-radius: 12px; background: rgba(16, 11, 5, 0.92);
         border: 1px solid rgba(212,175,55,0.45); color: #f0dfae; font-weight: 700; font-size: 14.5px;
-        opacity: 0; pointer-events: none; transition: all 0.22s ease; white-space: nowrap;
+        opacity: 0; pointer-events: none; transition: all 0.22s ease; white-space: normal;
+        max-width: min(86vw, 440px); text-align: center;
       }
       #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
       #overlay {
@@ -73,17 +76,22 @@
         #level { font-size: 18px; }
         #dotsWrap { display: none; }
         #hud { padding: 8px 14px; }
+        #tools { top: 10px; right: 10px; padding: 6px; gap: 6px; display: grid; grid-template-columns: 1fr 1fr; width: 196px; }
+        #tools button { font-size: 12px; padding: 7px 8px; max-width: none; width: 100%; }
+        #tools #rotate { grid-column: 1 / -1; }
+        #toast { top: 158px; }
       }
     </style>
   </head>
   <body>
     <div id="app"></div>
     <div class="vignette"></div>
-    <div id="hud" class="panel"><span id="level">Уровень 1</span><span id="moves">Ходов: 0</span><span id="coins">🪙 <b id="coinsNum">30</b></span></div>
+    <div id="hud" class="panel"><span id="level">Уровень 1</span><span id="moves">Ходов: 0</span><span id="coins">Монеты: <b id="coinsNum">30</b></span></div>
     <div id="dotsWrap" class="panel"><span id="dots" style="display:flex;gap:8px"></span></div>
     <div id="tools" class="panel">
-      <button id="hint" title="Подсказка (−15 🪙)">💡</button>
-      <button id="restart" title="Заново">🔄</button>
+      <button id="hint" title="Подсказка за 15 монет">Подсказка −15</button>
+      <button id="restart" title="Начать уровень заново">Заново</button>
+      <button id="rotate" hidden title="Повернуть двойную тарелку (R)">Повернуть двойную тарелку</button>
     </div>
     <div id="toast"></div>
     <div id="overlay">
