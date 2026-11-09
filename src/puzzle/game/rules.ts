@@ -168,13 +168,22 @@ export function chooseRecipient(
  * соседи, 2 — один транзит; Infinity — без ограничения, как до Этапа B).
  * Кандидаты на глубине ≤ maxHops принимаются, глубже BFS не расширяется
  * (семантика H-вариантов аудита §5).
+ *
+ * Эксперимент «Same Flavor Transit» (nextStep §2.3): при
+ * sameFlavorTransit = true транзитная тарелка допускается к переносу
+ * вкуса flavor, только если сама содержит хотя бы один кусочек этого
+ * вкуса — проверка независимо для каждого вкуса. Свободное место
+ * по-прежнему необходимо: правило добавляет требование вкуса, а не
+ * заменяет правило вместимости. Прямые переносы (маршруты без транзитов)
+ * правилом не затрагиваются. Экспортирована для тестов уровня правил.
  */
-function planChainFrom(
+export function planChainFrom(
   state: GState,
   start: CellIndex,
   flavor: Flavor,
   lastPlaced: readonly CellIndex[] | null,
   maxHops: number = Infinity,
+  sameFlavorTransit: boolean = false,
 ): Transfer | null {
   const { cols, rows, board } = state;
   const startPlate = board[start];
@@ -218,6 +227,11 @@ function planChainFrom(
     // транзит — только через тарелки со свободным местом; сама start
     // может быть полна: она конец маршрута, а не транзит
     if (cell !== start && space === 0) continue;
+    // Same Flavor Transit (nextStep §2.3 п. 2–5): транзитная тарелка
+    // пропускает вкус flavor, только если сама его держит; проверка
+    // независима для каждого вкуса. Свободное место само по себе
+    // разрешения не даёт, правило вместимости выше остаётся в силе (п. 7)
+    if (cell !== start && sameFlavorTransit && !hasFlavor) continue;
     if (d >= maxHops) continue; // глубже не расширяем (кандидаты до maxHops включительно)
     for (const nb of neighborCells(cols, rows, cell)) {
       if (!visited.has(nb) && board[nb]) {
@@ -283,12 +297,13 @@ export function planNextTransfer(
   }
   if (!config.allowChainTransfers) return null;
   // цепочки: несоседние тарелки, связанные маршрутом через свободные места;
-  // глубина BFS ограничена maxChainHops (кандидаты на глубине ≤ maxChainHops)
+  // глубина BFS ограничена maxChainHops (кандидаты на глубине ≤ maxChainHops),
+  // sameFlavorTransit требует от транзитных тарелок совпадающего вкуса
   for (let cell = 0; cell < board.length; cell++) {
     const p = board[cell];
     if (!p) continue;
     for (const f of distinctFlavors(p)) {
-      const chain = planChainFrom(state, cell, f, lastPlaced, config.maxChainHops);
+      const chain = planChainFrom(state, cell, f, lastPlaced, config.maxChainHops, config.sameFlavorTransit);
       if (chain) return chain;
     }
   }

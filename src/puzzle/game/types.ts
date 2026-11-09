@@ -178,9 +178,19 @@ export interface CascadeConfig {
   maxChainHops: number;
   /** прямые переносы раньше цепочек (уже реализовано до Этапа B) */
   directTransferPriority: boolean;
+  /** Эксперимент «Same Flavor Transit» (nextStep §2): транзитная тарелка
+   *  участвует в цепном переносе вкуса f, только если уже содержит хотя бы
+   *  один кусочек этого же вкуса. Проверка выполняется отдельно для каждого
+   *  вкуса; наличие другого вкуса или свободного места самого по себе не
+   *  даёт разрешения на транзит. Правила вместимости не меняются: полная
+   *  тарелка по-прежнему не пропускает кусочки. false — действующая
+   *  механика H2 без проверки вкуса транзита. */
+  sameFlavorTransit: boolean;
 }
 
-/** Конфиг по умолчанию: текущие правила без ограничений + защитный лимит */
+/** Конфиг по умолчанию: текущие правила без ограничений + защитный лимит.
+ *  sameFlavorTransit: false — умолчание воспроизводит действующий H2
+ *  (новая механика включается исключительно через конфигурацию). */
 export const DEFAULT_CASCADE_CONFIG: CascadeConfig = {
   maxResolutionSteps: 64,
   maxTransfersPerTurn: Infinity,
@@ -188,6 +198,7 @@ export const DEFAULT_CASCADE_CONFIG: CascadeConfig = {
   allowChainTransfers: true,
   maxChainHops: Infinity,
   directTransferPriority: true,
+  sameFlavorTransit: false,
 };
 
 /* ------------------------------------------------------------------ */
