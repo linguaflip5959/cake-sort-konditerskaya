@@ -29,7 +29,7 @@ import {
   sharedAdjacency,
   type Move,
 } from '../src/puzzle/game/rules';
-import { buildLevel, levelConfig, peekStream, targetFor, topUpTray, TRAINING_LEVELS } from '../src/puzzle/game/generator';
+import { buildLevel, buildLevelSized, levelConfig, peekStream, targetFor, topUpTray, TRAINING_LEVELS } from '../src/puzzle/game/generator';
 import { getLevel } from '../src/puzzle/game/levels';
 import {
   CAP,
@@ -45,6 +45,19 @@ import {
   type TrayItem,
   type TurnEvent,
 } from '../src/puzzle/game/types';
+import {
+  VARIANTS,
+  aggregate,
+  buildExperimentLevel,
+  countBlockedRoutes,
+  makeStrategy,
+  measureChoiceImpact,
+  seedAt,
+  simulateGame,
+  type AggregateRow,
+  type GameResult,
+  type StrategyName,
+} from './experiment-h2-sft';
 
 /* --------------------------- мини-фреймворк ------------------------- */
 
@@ -65,7 +78,7 @@ function test(name: string, fn: () => void): void {
   }
 }
 
-function assert(cond: unknown, msg: string): void {
+function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(msg);
 }
 
@@ -111,12 +124,18 @@ test('1.1 Очки: торт = 100, комбо +25 за каждый следу�
 
 test('1.2 Комбо растёт внутри хода и сбрасывается новым ходом', () => {
   const st = createInitialState(
-    lv(1, 4, [], [
-      { kind: 'single', slices: [3, 3, 3, 3, 3, 3] },
-      { kind: 'single', slices: [3, 3, 3, 3, 3, 3] },
-    ]),
-    500,
-  );  applyTrayMove(st, { trayIdx: 0, cells: [0], orientation: null });
+    lv(
+      1,
+      4,
+      [],
+      [
+        { kind: 'single', slices: [3, 3, 3, 3, 3, 3] },
+        { kind: 'single', slices: [3, 3, 3, 3, 3, 3] },
+      ],
+      500,
+    ),
+  );
+  applyTrayMove(st, { trayIdx: 0, cells: [0], orientation: null });
   resolveTurn(st, [0]); // готовый торт из 6 кусочков без переносов
   assertEq(st.points, CAKE_POINTS, 'первый торт — базовые очки');
   applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
@@ -1451,6 +1470,190 @@ test('10.11 Выключенный sameFlavorTransit — поведение со
     }
     assertEq(fingerprint(a), fingerprint(b), `уровень ${n}: итоговые состояния расходятся`);
   }
+});
+
+/* ------- 11. Симулятор сравнения (nextStep §4–5): apparatus-тесты ----- */
+/* Проверяется КОРРЕКТНОСТЬ аппарата эксперимента: генератор уровней
+ * произвольного размера, варианты механики, детектор блокировок,
+ * стратегии, детерминизм и границы метрик. Сравнительные симуляции
+ * (nextStep §5) отсюда НЕ запускаются — только мини-партии фиксированной
+ * длины для проверки инвариантов.                                        */
+
+test('11.1 buildLevelSized: 3×3 совпадает с buildLevel, прочие размеры валидны', () => {
+  for (let n = 1; n <= 12; n++) {
+    assertEq(JSON.stringify(buildLevelSized(n, 3, 3)), JSON.stringify(buildLevel(n)), `уровень ${n}: 3×3 ≡ buildLevel`);
+  }
+  for (const [rows, cols] of [
+    [3, 4],
+    [4, 4],
+    [4, 5],
+  ] as Array<[number, number]>) {
+    const level = buildLevelSized(6, rows, cols);
+    assertEq([level.rows, level.cols], [rows, cols], `поле ${rows}×${cols}: размеры`);
+    assertEq(level.tray.length, WINDOW + TRAY_BUFFER, `поле ${rows}×${cols}: стартовая выдача`);
+    assert((level.target ?? 0) > 0, `поле ${rows}×${cols}: цель задана`);
+    assert(level.stream !== undefined, `поле ${rows}×${cols}: поток на месте`);
+    for (const p of level.initial) {
+      assert(p.row >= 0 && p.row < rows && p.col >= 0 && p.col < cols, `поле ${rows}×${cols}: тарелка вне поля`);
+      assert(p.slices.length >= 1 && p.slices.length <= CAP, `поле ${rows}×${cols}: состав тарелки в границах`);
+    }
+  }
+});
+
+test('11.2 Выдача одинакова на разных полях; генератор детерминирован', () => {
+  for (let n = 1; n <= 8; n++) {
+    const a33 = buildLevelSized(n, 3, 3);
+    const b33 = buildLevelSized(n, 3, 3);
+    assertEq(JSON.stringify(a33), JSON.stringify(b33), `уровень ${n}: повтор сборки идентичен`);
+    const a45 = buildLevelSized(n, 4, 5);
+    assertEq(JSON.stringify(a45.tray), JSON.stringify(a33.tray), `уровень ${n}: выдача не зависит от поля`);
+    assertEq(a45.target, a33.target, `уровень ${n}: цель не зависит от поля`);
+    assertEq(JSON.stringify(a45.stream), JSON.stringify(a33.stream), `уровень ${n}: поток не зависит от поля`);
+  }
+});
+
+test('11.3 Варианты эксперимента и одинаковые начальные условия', () => {
+  assertEq(VARIANTS.map((v) => v.name), ['Unlimited', 'H2', 'H2+SFT'], 'три варианта, порядок зафиксирован');
+  assertEq(DEFAULT_CASCADE_CONFIG.sameFlavorTransit, false, 'игра по умолчанию — H2 без SFT');
+  const [unl, h2, sft] = VARIANTS;
+  assertEq(unl.cascade.maxChainHops, Infinity, 'Unlimited: дальность не ограничена');
+  assertEq(unl.cascade.sameFlavorTransit, false, 'Unlimited: без правила вкуса');
+  assertEq(h2.cascade.maxChainHops, 2, 'H2: два прыжка');
+  assertEq(h2.cascade.sameFlavorTransit, false, 'H2: без правила вкуса');
+  assertEq(sft.cascade.maxChainHops, 2, 'H2+SFT: два прыжка');
+  assertEq(sft.cascade.sameFlavorTransit, true, 'H2+SFT: правило вкуса включено');
+  // материал уровня у вариантов идентичен — различается только конфиг (§4.4)
+  const stripCascade = (l: LevelData): string => JSON.stringify({ ...l, cascade: undefined });
+  for (let n = 1; n <= 6; n++) {
+    const size = { rows: 3, cols: 4 };
+    const base = buildLevelSized(n, size.rows, size.cols);
+    for (const v of VARIANTS) {
+      const exp = buildExperimentLevel(n, size, v);
+      assertEq(stripCascade(exp), stripCascade(base), `уровень ${n}, ${v.name}: материал не зависит от варианта`);
+      assertEq(exp.cascade?.maxChainHops, v.cascade.maxChainHops, `уровень ${n}, ${v.name}: maxChainHops из варианта`);
+      assertEq(exp.cascade?.sameFlavorTransit, v.cascade.sameFlavorTransit, `уровень ${n}, ${v.name}: sameFlavorTransit из варианта`);
+    }
+  }
+});
+
+test('11.4 Заблокированные маршруты: разложение причин (прыжки против вкуса транзита)', () => {
+  // Поле 1×3: [7,7,7] [1,1] [7,7] — цепочка вкуса 7 в двух прыжках доступна,
+  // но транзит не содержит вкуса 7: правило SFT обязано её закрыть.
+  const st13 = createInitialState(lv(1, 3, [[0, 0, [7, 7, 7]], [0, 1, [1, 1]], [0, 2, [7, 7]]], []));
+  // Поле 1×4: до получателя три прыжка — за лимитом H2.
+  const st14 = createInitialState(lv(1, 4, [[0, 0, [7, 7, 7]], [0, 1, [1, 1]], [0, 2, [1, 1]], [0, 3, [7, 7]]], []));
+  const cfgUnl = { ...DEFAULT_CASCADE_CONFIG, maxChainHops: Infinity, sameFlavorTransit: false };
+  const cfgH2 = { ...DEFAULT_CASCADE_CONFIG, maxChainHops: 2, sameFlavorTransit: false };
+  const cfgSFT = { ...DEFAULT_CASCADE_CONFIG, maxChainHops: 2, sameFlavorTransit: true };
+
+  st13.cascade = cfgUnl;
+  assertEq(countBlockedRoutes(st13), { blockedHops: 0, blockedSFT: 0 }, '1×3 Unlimited: блокировок нет');
+  st13.cascade = cfgH2;
+  assertEq(countBlockedRoutes(st13), { blockedHops: 0, blockedSFT: 0 }, '1×3 H2: цепочка из двух прыжков доступна');
+  st13.cascade = cfgSFT;
+  assertEq(countBlockedRoutes(st13), { blockedHops: 0, blockedSFT: 2 }, '1×3 H2+SFT: оба старта вкуса 7 закрыты правилом вкуса');
+
+  st14.cascade = cfgUnl;
+  assertEq(countBlockedRoutes(st14), { blockedHops: 0, blockedSFT: 0 }, '1×4 Unlimited: блокировок нет');
+  st14.cascade = cfgH2;
+  assertEq(countBlockedRoutes(st14), { blockedHops: 2, blockedSFT: 0 }, '1×4 H2: оба старта вкуса 7 закрыты лимитом прыжков');
+  st14.cascade = cfgSFT;
+  assertEq(countBlockedRoutes(st14), { blockedHops: 2, blockedSFT: 0 }, '1×4 H2+SFT: лимит прыжков срабатывает раньше правила вкуса');
+});
+
+test('11.5 Стратегии возвращают только допустимые ходы', () => {
+  const names: StrategyName[] = ['random', 'immediate', 'space', 'combined'];
+  for (const n of [1, 6, 12]) {
+    const st = createInitialState(buildExperimentLevel(n, { rows: 3, cols: 3 }, VARIANTS[2]));
+    const legal = legalMoves(st);
+    assert(legal.length > 0, `уровень ${n}: нет допустимых ходов`);
+    for (const name of names) {
+      const mv = makeStrategy(name, seedAt(0))(st);
+      assert(mv !== null, `уровень ${n}, ${name}: стратегия не вернула ход`);
+      const found = legal.some(
+        (m) =>
+          mv !== null && m.trayIdx === mv.trayIdx && m.orientation === mv.orientation && m.cells.length === mv.cells.length && m.cells.every((c, i) => c === mv.cells[i]),
+      );
+      assert(found, `уровень ${n}, ${name}: ход вне списка допустимых`);
+    }
+  }
+});
+
+test('11.6 simulateGame: детерминизм, границы метрик, инварианты хода', () => {
+  const opts = { maxMoves: 40, impactEvery: 7 };
+  const strip = (g: GameResult): string => JSON.stringify({ ...g, ms: 0 });
+  for (const variant of VARIANTS) {
+    const level = buildExperimentLevel(3, { rows: 3, cols: 3 }, variant);
+    for (const strategy of ['random', 'immediate', 'space', 'combined'] as StrategyName[]) {
+      const a = simulateGame(level, variant.name, strategy, seedAt(1), opts, 3);
+      const b = simulateGame(level, variant.name, strategy, seedAt(1), opts, 3);
+      assertEq(strip(a), strip(b), `${variant.name}/${strategy}: повтор партии расходится`);
+      assert(a.outcome === 'won' || a.outcome === 'lost' || a.outcome === 'cap', `${variant.name}/${strategy}: исход ${a.outcome}`);
+      assert(a.moves <= opts.maxMoves, `${variant.name}/${strategy}: лимит ходов превышен`);
+      assert(a.points >= 0 && a.cakes >= 0, `${variant.name}/${strategy}: отрицательные очки или торты`);
+      for (const t of a.turns) {
+        assert(t.freeAfter >= 0 && t.freeAfter <= 9, `${variant.name}/${strategy}: свободные ячейки вне [0..9]`);
+        assert(t.blockedHops >= 0 && t.blockedSFT >= 0, `${variant.name}/${strategy}: отрицательные блокировки`);
+        assert(t.legalPlacements > 0, `${variant.name}/${strategy}: ход без допустимых размещений`);
+        if (t.chainTransfers > 0) {
+          assert(t.maxPath > 2, `${variant.name}/${strategy}: цепочка без маршрута длиннее прямого переноса`);
+          assert(t.chainPathSum >= 3 * t.chainTransfers, `${variant.name}/${strategy}: длина цепочки меньше трёх тарелок`);
+        }
+        assert(t.chainPathSum <= t.chainTransfers * 9, `${variant.name}/${strategy}: маршрут длиннее поля`);
+      }
+      if (variant.name === 'Unlimited') {
+        assert(a.turns.every((t) => t.blockedHops === 0 && t.blockedSFT === 0), `${variant.name}: блокировок быть не может`);
+      }
+    }
+  }
+});
+
+test('11.7 measureChoiceImpact: границы и сэмплирование', () => {
+  const st = createInitialState(buildLevel(1));
+  const legal = legalMoves(st);
+  const imp = measureChoiceImpact(st);
+  assertEq(imp.samples, legal.length, 'сэмплов — по числу допустимых размещений');
+  assert(imp.spread >= 0 && Number.isFinite(imp.spread), 'разброс конечен и неотрицателен');
+  assert(imp.std >= 0 && Number.isFinite(imp.std), 'σ конечна и неотрицательна');
+  assert(imp.spread >= imp.std, 'разброс не меньше σ');
+  // единственное размещение — разброс 0
+  const stOne = createInitialState(lv(1, 2, [[0, 0, [7]]], [{ kind: 'single', slices: [7, 7, 7] }]));
+  const one = measureChoiceImpact(stOne);
+  assertEq(one.samples, 1, 'одно размещение — один сэмпл');
+  assertEq(one.spread, 0, 'при одном размещении разброс — 0');
+});
+
+test('11.8 aggregate: инварианты сводки по вариантам', () => {
+  const results: GameResult[] = [];
+  for (const variant of VARIANTS) {
+    // 4 партии на вариант: уровни 1–2 × два сида (одна стратегия —
+    // одна группа на вариант; при общем уровне партии независимы
+    // благодаря копии уровня в simulateGame)
+    for (let n = 1; n <= 2; n++) {
+      const level = buildExperimentLevel(n, { rows: 3, cols: 3 }, variant);
+      results.push(simulateGame(level, variant.name, 'immediate', seedAt(0), { maxMoves: 80, impactEvery: 5 }, n));
+      results.push(simulateGame(level, variant.name, 'immediate', seedAt(1), { maxMoves: 80, impactEvery: 5 }, n));
+    }
+  }
+  const rows: AggregateRow[] = aggregate(results);
+  assertEq(rows.length, VARIANTS.length, 'по одной строке на вариант');
+  for (const r of rows) {
+    assertEq(r.games, 4, `${r.variant}: 4 партии в группе`);
+    assertEq(r.wins + r.losses + r.caps, r.games, `${r.variant}: исходы сходятся в сумму`);
+    assert(r.winRate >= 0 && r.winRate <= 1, `${r.variant}: winRate в [0..1]`);
+    assert(r.avgFree >= 0 && r.avgFree <= r.cells, `${r.variant}: средние свободные ячейки в границах`);
+    assert(r.minFree >= 0, `${r.variant}: минимум свободных ячеек неотрицателен`);
+    assert(r.chainShare >= 0 && r.chainShare <= 1, `${r.variant}: доля цепных в [0..1]`);
+    assert(r.maxChainLen >= 0 && r.maxChainLen <= r.cells, `${r.variant}: длина цепочки в границах поля`);
+    assert(r.cakesPerMove >= 0 && r.turnWithCakeShare + r.turnNoCakeShare <= 1.001, `${r.variant}: доли ходов согласованы`);
+    assert(r.avgLegalPlacements > 0, `${r.variant}: размещения считаются`);
+    assert(r.impactSpread >= r.impactStd && r.impactStd >= 0, `${r.variant}: разброс ≥ σ ≥ 0`);
+    assert(r.impactSamples > 0, `${r.variant}: сэмплы влияния выбора собираются`);
+  }
+  const unl = rows.find((r) => r.variant === 'Unlimited');
+  assert(unl !== undefined && unl.blockedHopsPerTurn === 0 && unl.blockedSFTPerTurn === 0, 'Unlimited: блокировок быть не может');
+  const sft = rows.find((r) => r.variant === 'H2+SFT');
+  assert(sft !== undefined && sft.blockedHopsPerTurn >= 0 && sft.blockedSFTPerTurn >= 0, 'H2+SFT: блокировки считаются');
 });
 
 /* ------------------------------ Итог -------------------------------- */

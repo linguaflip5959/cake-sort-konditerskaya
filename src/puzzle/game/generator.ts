@@ -220,11 +220,25 @@ export const LEVEL_COLS = 3;
  * (WINDOW + TRAY_BUFFER элементов) и бесконечный поток с сидом.
  */
 export function buildLevel(n: number): LevelData {
+  return buildLevelSized(n, LEVEL_ROWS, LEVEL_COLS);
+}
+
+/**
+ * Уровень на поле произвольного размера (nextStep §4.1: «размер поля не
+ * должен быть жёстко привязан к генератору»). Конфигурация, состав потока
+ * и сид совпадают с buildLevel(n) — различаются только геометрия поля и
+ * раскладка начальных тарелок. Выдача (tray/stream) от размера поля не
+ * зависит: одинаковые уровни на разных полях раздают один и тот же материал.
+ *
+ * Игровой код продолжает использовать buildLevel (3×3); функция — для
+ * симулятора сравнения механик и будущей прогрессии размеров.
+ */
+export function buildLevelSized(n: number, rows: number, cols: number): LevelData {
   const cfg = levelConfig(n);
   const rng = mulberry32(cfg.seed);
 
-  // начальные тарелки: 2–3 штуки в случайных разных ячейках
-  const cells = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+  // начальные тарелки: 2–3 штуки в случайных разных ячейках поля rows×cols
+  const cells = new Array(rows * cols).fill(0).map((_, i) => i);
   for (let i = cells.length - 1; i > 0; i--) {
     const j = Math.floor(rng() * (i + 1));
     [cells[i], cells[j]] = [cells[j], cells[i]];
@@ -233,8 +247,8 @@ export function buildLevel(n: number): LevelData {
   for (let k = 0; k < cfg.initialCount; k++) {
     const cell = cells[k];
     initial.push({
-      row: Math.floor(cell / LEVEL_COLS),
-      col: cell % LEVEL_COLS,
+      row: Math.floor(cell / cols),
+      col: cell % cols,
       slices: plateSlices(rng, cfg, 5),
     });
   }
@@ -252,8 +266,8 @@ export function buildLevel(n: number): LevelData {
   }
 
   return {
-    rows: LEVEL_ROWS,
-    cols: LEVEL_COLS,
+    rows,
+    cols,
     initial,
     tray,
     target: cfg.target,
