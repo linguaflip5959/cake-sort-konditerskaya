@@ -1,18 +1,31 @@
 /**
  * Cake Sort — «Кондитерская»: сравнительный симулятор механик
- * «H2 + Same Flavor Transit» (nextStep §4–5).
+ * «H2 + Same Flavor Transit» (nextStep §4–5) + дополнения:
+ *   • 4-я конфигурация «H2 + SFT + Direct Transfer Priority OFF»
+ *     (nextStep, дополнение к эксперименту H2 + Same Flavor Transit);
+ *   • матрица «Приоритет новой тарелки как получателя переноса»
+ *     (ТЗ-дополнение §3: H2 / H2+NPP × без SFT / с SFT).
  *
  * ЗАПУСК: npx tsx scripts/experiment-h2-sft.ts --run [опции]
  * Без флага --run скрипт печатает план запуска и НЕ стартует симуляции —
  * по регламенту работы: «сначала реализация и тесты, затем симуляции».
  *
- * Сравниваются три варианта механики на одинаковых уровнях, размерах поля
+ * Сравниваются ШЕСТЬ вариантов на одинаковых уровнях, размерах поля
  * и сидах (nextStep §4.4: «одинаковые seed и одинаковые начальные условия»):
  *
- *   Unlimited — исходная механика без ограничения дальности цепочек;
- *   H2        — два прыжка (донор → один транзит → получатель);
- *   H2 + SFT  — H2 плюс правило вкуса транзита: транзитная тарелка
- *               пропускает вкус, только если уже содержит его (§2.3).
+ *   Unlimited     — исходная механика без ограничения дальности цепочек;
+ *   H2            — два прыжка (донор → один транзит → получатель);
+ *   H2+SFT        — H2 плюс правило вкуса транзита (§2.3);
+ *   H2+SFT+NoDP   — H2 + SFT + приоритет прямых переносов выключен
+ *                   (4-я конфигурация: цепи не вытесняются прямыми);
+ *   H2+NPP        — H2 + приоритет новой тарелки как получателя
+ *                   (ТЗ-дополнение §1);
+ *   H2+SFT+NPP    — H2 + SFT + приоритет новой тарелки (совместная
+ *                   проверка правил, ТЗ-дополнение §2).
+ *
+ * Два сравнения из ТЗ строятся из этих шести вариантов:
+ *   Сравнение A (nextStep, дополнение): Unlimited, H2, H2+SFT, H2+SFT+NoDP;
+ *   Сравнение B (ТЗ-дополнение §3):     H2, H2+NPP, H2+SFT, H2+SFT+NPP.
  *
  * Симулятор использует НАСТОЯЩУЮ игровую логику проекта (game/rules.ts,
  * game/generator.ts) — отдельной реализации правил нет (nextStep §4).
@@ -82,8 +95,12 @@ export interface MechanicVariant {
   cascade: Partial<CascadeConfig>;
 }
 
-/** Три сравниваемых варианта (nextStep §2.4, §4.2). Действующий H2 игры
- *  не меняется: DEFAULT_CASCADE_CONFIG.sameFlavorTransit = false. */
+/** Шесть сравниваемых вариантов. Первые три — без изменений (регламент
+ *  дополнения к эксперименту: «не изменять существующие правила H2»);
+ *  четвёртый и два NPP-варианта — экспериментальные, В ОСНОВНУЮ
+ *  конфигурацию не входят (ТЗ-дополнение §3, §6). Действующий H2 игры
+ *  не меняется: DEFAULT_CASCADE_CONFIG.sameFlavorTransit = false,
+ *  newPlatePriority = false. */
 export const VARIANTS: MechanicVariant[] = [
   {
     name: 'Unlimited',
@@ -100,7 +117,27 @@ export const VARIANTS: MechanicVariant[] = [
     title: 'H2 + транзит только для вкуса, уже лежащего на транзитной тарелке',
     cascade: { maxChainHops: 2, sameFlavorTransit: true },
   },
+  {
+    name: 'H2+SFT+NoDP',
+    title: 'H2 + SFT + приоритет прямых переносов выключен (4-я конфигурация)',
+    cascade: { maxChainHops: 2, sameFlavorTransit: true, directTransferPriority: false },
+  },
+  {
+    name: 'H2+NPP',
+    title: 'H2 + приоритет новой тарелки как получателя переноса',
+    cascade: { maxChainHops: 2, sameFlavorTransit: false, newPlatePriority: true },
+  },
+  {
+    name: 'H2+SFT+NPP',
+    title: 'H2 + SFT + приоритет новой тарелки (совместная проверка правил)',
+    cascade: { maxChainHops: 2, sameFlavorTransit: true, newPlatePriority: true },
+  },
 ];
+
+/** Сравнение A (nextStep, дополнение к эксперименту): все четыре варианта */
+export const COMPARISON_A: string[] = ['Unlimited', 'H2', 'H2+SFT', 'H2+SFT+NoDP'];
+/** Сравнение B (ТЗ-дополнение §3): матрица приоритета новой тарелки */
+export const COMPARISON_B: string[] = ['H2', 'H2+NPP', 'H2+SFT', 'H2+SFT+NPP'];
 
 export interface BoardSize {
   rows: number;
@@ -277,6 +314,8 @@ export function buildExperimentLevel(n: number, size: BoardSize, variant: Mechan
       ...base.cascade,
       maxChainHops: variant.cascade.maxChainHops ?? DEFAULT_CASCADE_CONFIG.maxChainHops,
       sameFlavorTransit: variant.cascade.sameFlavorTransit ?? DEFAULT_CASCADE_CONFIG.sameFlavorTransit,
+      directTransferPriority: variant.cascade.directTransferPriority ?? DEFAULT_CASCADE_CONFIG.directTransferPriority,
+      newPlatePriority: variant.cascade.newPlatePriority ?? DEFAULT_CASCADE_CONFIG.newPlatePriority,
     },
   };
 }
@@ -311,6 +350,12 @@ export interface TurnRecord {
   chainPathSum: number;
   /** максимальная длина маршрута за ход (тарелок в path) */
   maxPath: number;
+  /** переносов, где получатель — тарелка, размещённая в этом ходу (ТЗ-дополнение §5) */
+  toNewPlate: number;
+  /** переносов, где донор — тарелка, размещённая в этом ходу */
+  fromNewPlate: number;
+  /** разрешение хода оборвано защитным лимитом (осцилляция при NPP — см. тест 13.11) */
+  aborted: boolean;
   cakes: number;
   freeAfter: number;
   /** допустимых размещений было в начале хода */
@@ -393,10 +438,15 @@ export function simulateGame(
     let chainTransfers = 0;
     let chainPathSum = 0;
     let maxPath = 0;
+    let toNewPlate = 0;
+    let fromNewPlate = 0;
+    let aborted = false;
     let turnCakes = 0;
     for (const ev of log) {
       if (ev.kind === 'transfer') {
         transfers++;
+        if (mv.cells.includes(ev.transfer.to)) toNewPlate++;
+        if (mv.cells.includes(ev.transfer.from)) fromNewPlate++;
         if (ev.transfer.path.length > 2) {
           chainTransfers++;
           chainPathSum += ev.transfer.path.length;
@@ -405,6 +455,8 @@ export function simulateGame(
       } else if (ev.kind === 'cake') {
         turnCakes++;
         cakes++;
+      } else if (ev.kind === 'aborted') {
+        aborted = true;
       }
     }
     const blocked = countBlockedRoutes(st);
@@ -413,6 +465,9 @@ export function simulateGame(
       chainTransfers,
       chainPathSum,
       maxPath,
+      toNewPlate,
+      fromNewPlate,
+      aborted,
       cakes: turnCakes,
       freeAfter: freeCells(st).length,
       legalPlacements: legal.length,
@@ -481,6 +536,18 @@ export interface AggregateRow {
   blockedHopsPerTurn: number;
   blockedSFTPerTurn: number;
   avgPoints: number;
+  /** всего ходов в группе (для абсолютных количеств из долей) */
+  turnsTotal: number;
+  /** ходов без сборки торта — количество (nextStep, дополнение: «количество ходов без сборки») */
+  noCakeTurns: number;
+  /** переносов с получателем — новой тарелкой — количество (ТЗ-дополнение §5) */
+  toNewPlate: number;
+  /** переносов с донором — новой тарелкой — количество */
+  fromNewPlate: number;
+  /** доля переносов в новую тарелку среди всех переносов */
+  newPlateShare: number;
+  /** ходов, оборванных защитным лимитом разрешения (осцилляция NPP) */
+  abortedTurns: number;
   impactSpread: number;
   impactStd: number;
   impactSamples: number;
@@ -538,6 +605,12 @@ export function aggregate(results: GameResult[]): AggregateRow[] {
       blockedHopsPerTurn: turns.reduce((a, t) => a + t.blockedHops, 0) / nTurns,
       blockedSFTPerTurn: turns.reduce((a, t) => a + t.blockedSFT, 0) / nTurns,
       avgPoints: games.reduce((a, g) => a + g.points, 0) / games.length,
+      turnsTotal: turns.length,
+      noCakeTurns: turns.filter((t) => t.cakes === 0).length,
+      toNewPlate: turns.reduce((a, t) => a + t.toNewPlate, 0),
+      fromNewPlate: turns.reduce((a, t) => a + t.fromNewPlate, 0),
+      newPlateShare: transfers > 0 ? turns.reduce((a, t) => a + t.toNewPlate, 0) / transfers : 0,
+      abortedTurns: turns.filter((t) => t.aborted).length,
       impactSpread: impacts.length > 0 ? impacts.reduce((a, t) => a + (t.impact?.spread ?? 0), 0) / impacts.length : 0,
       impactStd: impacts.length > 0 ? impacts.reduce((a, t) => a + (t.impact?.std ?? 0), 0) / impacts.length : 0,
       impactSamples: impacts.reduce((a, t) => a + (t.impact?.samples ?? 0), 0),
@@ -549,31 +622,40 @@ export function aggregate(results: GameResult[]): AggregateRow[] {
 const pct = (x: number): string => `${(x * 100).toFixed(0)}%`;
 const num = (x: number, d = 2): string => x.toFixed(d);
 
-/** Сводная таблица §5: метрики (строки) × варианты (столбцы) */
-export function summaryTable(rows: AggregateRow[], size: BoardSize, strategy: StrategyName): string {
+/** Сводная таблица §5: метрики (строки) × варианты (столбцы).
+ *  names — список вариантов сравнения (A: дополнение к эксперименту;
+ *  B: ТЗ-дополнение §3); строка возвращается только при наличии данных
+ *  по всем вариантам списка. */
+export function summaryTable(rows: AggregateRow[], size: BoardSize, strategy: StrategyName, names: readonly string[]): string {
   const cells = size.rows * size.cols;
-  const col = (v: string): AggregateRow | undefined =>
-    rows.find((r) => r.variant === v && r.rows === size.rows && r.cols === size.cols && r.strategy === strategy);
-  const a = col('Unlimited');
-  const b = col('H2');
-  const c = col('H2+SFT');
-  if (!a || !b || !c) return '';
-  const fmt = (r: AggregateRow | undefined, f: (x: AggregateRow) => string): string => (r ? f(r) : '—');
+  const byName = new Map(rows.filter((r) => r.rows === size.rows && r.cols === size.cols && r.strategy === strategy).map((r) => [r.variant, r]));
+  const cols = names.map((n) => byName.get(n));
+  if (cols.some((c) => !c)) return '';
+  const a = cols[0]!;
+  const head = names.map((n) => n.padStart(13)).join(' | ');
   const line = (label: string, f: (x: AggregateRow) => string): string =>
-    `  ${label.padEnd(34)} | ${fmt(a, f).padStart(9)} | ${fmt(b, f).padStart(9)} | ${fmt(c, f).padStart(9)}`;
+    `  ${label.padEnd(34)} | ${cols.map((c) => f(c!).padStart(13)).join(' | ')}`;
   const games = a.games;
   return [
     `Поле ${sizeLabel(size)}, стратегия ${strategy} (${games} партий = уровни × сиды)`,
+    `  ${''.padEnd(34)} | ${head}`,
     line('Победы, %', (r) => pct(r.winRate)),
     line('Поражения (full/leftover/cap)', (r) => `${r.losses}/${r.lossReasons['full'] ?? 0}/${r.caps}`),
     line('Ходов в партии (средн.)', (r) => num(r.avgMoves, 1)),
+    line('Тортов собрано (всего)', (r) => String(r.totalCakes)),
     line('Тортов за ход', (r) => num(r.cakesPerMove)),
     line('Ходов со сборкой торта, %', (r) => pct(r.turnWithCakeShare)),
+    line('Ходов без сборки — количество', (r) => String(r.noCakeTurns)),
     line(`Свободных ячеек (средн. из ${cells})`, (r) => `${num(r.avgFree)} (мин ${r.minFree})`),
+    line('Переносов (всего)', (r) => String(r.transfers)),
+    line('Цепных переносов — количество', (r) => String(r.chainTransfers)),
     line('Доля цепных переносов, %', (r) => pct(r.chainShare)),
     line('Средняя длина цепочки', (r) => num(r.avgChainLen)),
     line('Максимальная длина цепочки', (r) => String(r.maxChainLen)),
-    line('Блокировки маршрутов за ход', (r) => `${num(r.blockedHopsPerTurn)}+${num(r.blockedSFTPerTurn)}= ${num(r.blockedHopsPerTurn + r.blockedSFTPerTurn)}`),
+    line('Переносов в новую тарелку — кол-во', (r) => String(r.toNewPlate)),
+    line('Доля переносов в новую тарелку, %', (r) => pct(r.newPlateShare)),
+    line('Ходов с абортом разрешения', (r) => String(r.abortedTurns)),
+    line('Блокировки маршрутов за ход', (r) => `${num(r.blockedHopsPerTurn)}+${num(r.blockedSFTPerTurn)}=${num(r.blockedHopsPerTurn + r.blockedSFTPerTurn)}`),
     line('Влияние выбора ячейки (σ очков)', (r) => `${num(r.impactStd)} (разброс ${num(r.impactSpread, 1)})`),
     '',
   ].join('\n');
@@ -716,19 +798,24 @@ function main(): void {
   }
   const rows = runExperiment(opts);
 
-  console.log('\n=== Сводные таблицы (nextStep §5) ===\n');
+  console.log('\n=== Сводные таблицы (nextStep §5 + дополнения) ===\n');
   for (const size of opts.sizes) {
     for (const strategy of opts.strategies) {
-      const table = summaryTable(rows, size, strategy);
-      if (table) console.log(table);
+      const tableA = summaryTable(rows, size, strategy, COMPARISON_A);
+      if (tableA) console.log(`— Сравнение A (H2 + SFT, 4 конфигурации):\n${tableA}`);
+      const tableB = summaryTable(rows, size, strategy, COMPARISON_B);
+      if (tableB) console.log(`— Сравнение B (приоритет новой тарелки, ТЗ-дополнение §3):\n${tableB}`);
     }
   }
 
   console.log('Примечания:');
   console.log(' - Блокировки маршрутов за ход: прыжки+вкус (разложение причин; Unlimited — всегда 0+0).');
   console.log(' - Влияние выбора ячейки — σ немедленных очков по всем допустимым размещениям (сэмплирование).');
+  console.log(' - Переносы в новую тарелку считаются по получателю: ячейка, размещённая в текущем ходу.');
   console.log(' - Уменьшение собранных тортов само по себе не является улучшением: важен баланс');
-  console.log('   сложности, управляемости и продолжительности партии (nextStep §5, §10).\n');
+  console.log('   сложности, управляемости и продолжительности партии (nextStep §5, §10).');
+  console.log(' - Победившая механика НЕ выбирается автоматически; правила игры не меняются');
+  console.log('   по результатам симуляций без отдельного согласования (nextStep, дополнение; ТЗ-дополнение §6).\n');
 
   if (opts.out) {
     const payload = {
@@ -740,6 +827,7 @@ function main(): void {
         maxMoves: opts.maxMoves,
         impactEvery: opts.impactEvery,
         variants: VARIANTS.map((v) => ({ name: v.name, title: v.title, cascade: { ...v.cascade, maxChainHops: v.cascade.maxChainHops === Infinity ? '∞' : v.cascade.maxChainHops } })),
+        comparisons: { A: COMPARISON_A, B: COMPARISON_B },
       },
       aggregates: rows,
     };

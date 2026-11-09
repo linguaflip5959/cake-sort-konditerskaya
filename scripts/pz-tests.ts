@@ -46,14 +46,16 @@ import {
   type TurnEvent,
 } from '../src/puzzle/game/types';
 import {
-  VARIANTS,
   aggregate,
   buildExperimentLevel,
+  COMPARISON_A,
+  COMPARISON_B,
   countBlockedRoutes,
   makeStrategy,
   measureChoiceImpact,
   seedAt,
   simulateGame,
+  VARIANTS,
   type AggregateRow,
   type GameResult,
   type StrategyName,
@@ -1513,15 +1515,36 @@ test('11.2 Выдача одинакова на разных полях; ген�
 });
 
 test('11.3 Варианты эксперимента и одинаковые начальные условия', () => {
-  assertEq(VARIANTS.map((v) => v.name), ['Unlimited', 'H2', 'H2+SFT'], 'три варианта, порядок зафиксирован');
+  assertEq(
+    VARIANTS.map((v) => v.name),
+    ['Unlimited', 'H2', 'H2+SFT', 'H2+SFT+NoDP', 'H2+NPP', 'H2+SFT+NPP'],
+    'шесть вариантов: 3 исходных + 4-я конфигурация + NPP-матрица',
+  );
   assertEq(DEFAULT_CASCADE_CONFIG.sameFlavorTransit, false, 'игра по умолчанию — H2 без SFT');
-  const [unl, h2, sft] = VARIANTS;
+  assertEq(DEFAULT_CASCADE_CONFIG.newPlatePriority, false, 'игра по умолчанию — без приоритета новой тарелки');
+  assertEq(DEFAULT_CASCADE_CONFIG.directTransferPriority, true, 'игра по умолчанию — приоритет прямых переносов');
+  const [unl, h2, sft, nodp, npp, sftnpp] = VARIANTS;
   assertEq(unl.cascade.maxChainHops, Infinity, 'Unlimited: дальность не ограничена');
   assertEq(unl.cascade.sameFlavorTransit, false, 'Unlimited: без правила вкуса');
   assertEq(h2.cascade.maxChainHops, 2, 'H2: два прыжка');
   assertEq(h2.cascade.sameFlavorTransit, false, 'H2: без правила вкуса');
   assertEq(sft.cascade.maxChainHops, 2, 'H2+SFT: два прыжка');
   assertEq(sft.cascade.sameFlavorTransit, true, 'H2+SFT: правило вкуса включено');
+  // 4-я конфигурация: единственное отличие от H2+SFT — выключенный приоритет прямых
+  assertEq(nodp.cascade.maxChainHops, 2, 'H2+SFT+NoDP: два прыжка');
+  assertEq(nodp.cascade.sameFlavorTransit, true, 'H2+SFT+NoDP: правило вкуса включено');
+  assertEq(nodp.cascade.directTransferPriority, false, 'H2+SFT+NoDP: приоритет прямых выключен');
+  assertEq(nodp.cascade.newPlatePriority, undefined, 'H2+SFT+NoDP: приоритет новой тарелки не тронут');
+  // NPP-матрица (ТЗ-дополнение §3)
+  assertEq(npp.cascade.maxChainHops, 2, 'H2+NPP: два прыжка');
+  assertEq(npp.cascade.newPlatePriority, true, 'H2+NPP: приоритет новой тарелки включён');
+  assertEq(npp.cascade.sameFlavorTransit, false, 'H2+NPP: без правила вкуса');
+  assertEq(sftnpp.cascade.maxChainHops, 2, 'H2+SFT+NPP: два прыжка');
+  assertEq(sftnpp.cascade.sameFlavorTransit, true, 'H2+SFT+NPP: правило вкуса включено');
+  assertEq(sftnpp.cascade.newPlatePriority, true, 'H2+SFT+NPP: приоритет новой тарелки включён');
+  // сравнения из ТЗ покрываются этими шестью вариантами
+  assertEq(COMPARISON_A, ['Unlimited', 'H2', 'H2+SFT', 'H2+SFT+NoDP'], 'сравнение A — 4 конфигурации H2+SFT');
+  assertEq(COMPARISON_B, ['H2', 'H2+NPP', 'H2+SFT', 'H2+SFT+NPP'], 'сравнение B — матрица приоритета новой тарелки');
   // материал уровня у вариантов идентичен — различается только конфиг (§4.4)
   const stripCascade = (l: LevelData): string => JSON.stringify({ ...l, cascade: undefined });
   for (let n = 1; n <= 6; n++) {
@@ -1532,6 +1555,16 @@ test('11.3 Варианты эксперимента и одинаковые н�
       assertEq(stripCascade(exp), stripCascade(base), `уровень ${n}, ${v.name}: материал не зависит от варианта`);
       assertEq(exp.cascade?.maxChainHops, v.cascade.maxChainHops, `уровень ${n}, ${v.name}: maxChainHops из варианта`);
       assertEq(exp.cascade?.sameFlavorTransit, v.cascade.sameFlavorTransit, `уровень ${n}, ${v.name}: sameFlavorTransit из варианта`);
+      assertEq(
+        exp.cascade?.directTransferPriority,
+        v.cascade.directTransferPriority ?? DEFAULT_CASCADE_CONFIG.directTransferPriority,
+        `уровень ${n}, ${v.name}: directTransferPriority из варианта (или умолчание)`,
+      );
+      assertEq(
+        exp.cascade?.newPlatePriority,
+        v.cascade.newPlatePriority ?? DEFAULT_CASCADE_CONFIG.newPlatePriority,
+        `уровень ${n}, ${v.name}: newPlatePriority из варианта (или умолчание)`,
+      );
     }
   }
 });
@@ -1654,6 +1687,632 @@ test('11.8 aggregate: инварианты сводки по вариантам'
   assert(unl !== undefined && unl.blockedHopsPerTurn === 0 && unl.blockedSFTPerTurn === 0, 'Unlimited: блокировок быть не может');
   const sft = rows.find((r) => r.variant === 'H2+SFT');
   assert(sft !== undefined && sft.blockedHopsPerTurn >= 0 && sft.blockedSFTPerTurn >= 0, 'H2+SFT: блокировки считаются');
+});
+
+/* -- 12. Четвёртая конфигурация: H2 + SFT + приоритет прямых OFF ------- */
+/* nextStep, «Дополнение к эксперименту H2 + Same Flavor Transit»:
+ * конфликт условия допуска транзита и приоритета прямых переносов
+ * разрешается отдельной ЭКСПЕРИМЕНТАЛЬНОЙ конфигурацией. Ограничения
+ * соблюдены: правила H2 не меняются, стандартный приоритет прямых
+ * сохранён, алгоритм выбора получателя и порядок обработки вкусов не
+ * тронуты, конфигурация по умолчанию не изменилась (см. 11.3, 12.4).     */
+
+/** Конфигурация 4-го варианта: H2 + SFT + флаг приоритета прямых переносов */
+function noDpCfg(directPriority: boolean): CascadeConfig {
+  return { ...DEFAULT_CASCADE_CONFIG, maxChainHops: 2, sameFlavorTransit: true, directTransferPriority: directPriority };
+}
+
+test('12.1 Приоритет прямых выключен — SFT-цепочка возникает на примере ТЗ §2.2', () => {
+  // Поле sftExampleLevel: размещённая P (полная), транзит M, шоколадная C,
+  // ванильная V. Приоритет прямых ВКЛ (тест 10.5): прямой перенос M→C
+  // вытесняет цепочку — 0 цепочек, 0 тортов. Приоритет ВЫКЛ: цепочный
+  // проход находит P→M→C раньше прямой пары M→C.
+  const st = createInitialState(sftExampleLevel());
+  applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
+  // контраст флагов на одном и том же поле (первый перенос хода):
+  const firstOn = planNextTransfer(st, [1], noDpCfg(true));
+  assertEq(firstOn, { from: 4, to: 7, flavor: 0, count: 1, path: [4, 7] }, 'приоритет ВКЛ: первый перенос — прямой M→C');
+  const firstOff = planNextTransfer(st, [1], noDpCfg(false));
+  assertEq(firstOff, { from: 1, to: 7, flavor: 0, count: 1, path: [1, 4, 7] }, 'приоритет ВЫКЛ: первый перенос — цепочка P→M→C');
+  // полный ход с выключенным приоритетом: цепочка + затем прямой M→C,
+  // шоколадный торт собирается (в отличие от 10.5, где SFT+приоритет = 0 тортов)
+  const st2 = createInitialState(sftExampleLevel());
+  applyTrayMove(st2, { trayIdx: 0, cells: [1], orientation: null });
+  const log = resolveTurnLogged(st2, [1], noDpCfg(false));
+  const transfers = log.filter((e): e is Extract<TurnEvent, { kind: 'transfer' }> => e.kind === 'transfer');
+  assertEq(
+    transfers.map((e) => e.transfer.path),
+    [
+      [1, 4, 7],
+      [4, 7],
+    ],
+    'ход: сначала цепочка P→M→C, затем прямой M→C',
+  );
+  assertEq(st2.completed, 1, 'шоколадный торт собран (цепочка не вытеснена)');
+  assertEq(st2.points, CAKE_POINTS + MERGE_POINTS * 2, 'очки: 100 за торт + 2 переноса');
+  // ваниль по-прежнему блокирована SFT: в журнале нет переносов вкуса 1
+  assert(transfers.every((e) => e.transfer.flavor === 0), 'SFT: ваниль не проходит через M (вкуса нет в транзите)');
+});
+
+test('12.2 Цепочные переносы в реальных партиях с 4-й конфигурацией', () => {
+  // Ключевая проверка перед симуляциями (nextStep, дополнение: «подтвердить,
+  // что в четвёртой конфигурации действительно возникают цепные переносы»).
+  let chainTransfers = 0;
+  let totalTransfers = 0;
+  for (let n = 1; n <= 12; n++) {
+    const level = buildLevel(n);
+    level.cascade = { ...level.cascade, maxChainHops: 2, sameFlavorTransit: true, directTransferPriority: false };
+    const st = createInitialState(level);
+    const initialSlices = level.initial.reduce((s, p) => s + p.slices.length, 0);
+    let placedSlices = 0;
+    for (let m = 0; m < 40; m++) {
+      const mv = bestMove(st);
+      if (!mv) break;
+      placedSlices += traySize(st.tray[mv.trayIdx]);
+      applyTrayMove(st, mv);
+      const log = resolveTurnLogged(st, mv.cells);
+      assert(log.every((e) => e.kind !== 'aborted'), `уровень ${n}, ход ${m}: защитный лимит не должен срабатывать`);
+      for (const e of log) {
+        if (e.kind !== 'transfer') continue;
+        totalTransfers++;
+        if (e.transfer.path.length > 2) chainTransfers++;
+        assert(e.transfer.path.length <= 3, `уровень ${n}, ход ${m}: маршрут длиннее H2 (2 прыжка)`);
+      }
+      for (const p of st.board) {
+        if (p) assert(p.slices.length >= 1 && p.slices.length <= CAP, `уровень ${n}, ход ${m}: битая тарелка`);
+      }
+      const onBoard = st.board.reduce((s, p) => s + (p ? p.slices.length : 0), 0);
+      assertEq(initialSlices + placedSlices, onBoard + CAP * st.completed, `уровень ${n}, ход ${m}: кусочки не теряются`);
+      topUpTray(level, st);
+      if (evalEnd(st).phase !== 'playing') break;
+    }
+  }
+  assert(totalTransfers > 0, 'переносы в партиях должны происходить');
+  assert(chainTransfers > 0, '4-я конфигурация: цепные переносы действительно возникают');
+  // случайный игрок (детерминированный) — гарантии целостности; цепочки
+  // от случайных расстановок не гарантируются (нужна топология «полный
+  // донор → транзит со вкусом → получатель»), поэтому только инварианты
+  for (let n = 1; n <= 6; n++) {
+    const level = buildLevel(n);
+    level.cascade = { ...level.cascade, maxChainHops: 2, sameFlavorTransit: true, directTransferPriority: false };
+    const st = createInitialState(level);
+    let seed = n * 911;
+    const rnd = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+    for (let m = 0; m < 25; m++) {
+      const moves = legalMoves(st);
+      if (moves.length === 0) break;
+      const mv = moves[Math.floor(rnd() * moves.length)];
+      applyTrayMove(st, mv);
+      const log = resolveTurnLogged(st, mv.cells);
+      assert(log.every((e) => e.kind !== 'aborted'), `случайный, уровень ${n}, ход ${m}: без срабатывания лимита`);
+      for (const e of log) {
+        if (e.kind === 'transfer') assert(e.transfer.path.length <= 3, `случайный, уровень ${n}: маршрут длиннее H2`);
+      }
+      for (const p of st.board) {
+        if (p) assert(p.slices.length >= 1 && p.slices.length <= CAP, `случайный, уровень ${n}, ход ${m}: битая тарелка`);
+      }
+      topUpTray(level, st);
+      if (evalEnd(st).phase !== 'playing') break;
+    }
+  }
+});
+
+test('12.3 Остальные три конфигурации сохранили прежнее поведение', () => {
+  // (а) умолчания движка не изменились — поле в поле с конфигом до экспериментов
+  assertEq(DEFAULT_CASCADE_CONFIG.maxResolutionSteps, 64, 'умолчание: защитный лимит шагов');
+  assertEq(DEFAULT_CASCADE_CONFIG.maxTransfersPerTurn, Infinity, 'умолчание: переносов без лимита');
+  assertEq(DEFAULT_CASCADE_CONFIG.maxCakesPerTurn, Infinity, 'умолчание: тортов без лимита');
+  assertEq(DEFAULT_CASCADE_CONFIG.allowChainTransfers, true, 'умолчание: цепочки разрешены');
+  assertEq(DEFAULT_CASCADE_CONFIG.maxChainHops, Infinity, 'умолчание: дальность не ограничена');
+  assertEq(DEFAULT_CASCADE_CONFIG.directTransferPriority, true, 'умолчание: приоритет прямых включён (стандарт не тронут)');
+  assertEq(DEFAULT_CASCADE_CONFIG.sameFlavorTransit, false, 'умолчание: без правила вкуса (H2)');
+  assertEq(DEFAULT_CASCADE_CONFIG.newPlatePriority, false, 'умолчание: без приоритета новой тарелки');
+  // (б) первые три варианта: конфиги те же, что до дополнения
+  assertEq(JSON.stringify({ hops: VARIANTS[0].cascade.maxChainHops, sft: VARIANTS[0].cascade.sameFlavorTransit }), '{"hops":null,"sft":false}', 'Unlimited: прежний конфиг (∞ сериализуется как null)');
+  assertEq(JSON.stringify(VARIANTS[1].cascade), '{"maxChainHops":2,"sameFlavorTransit":false}', 'H2: прежний конфиг');
+  assertEq(JSON.stringify(VARIANTS[2].cascade), '{"maxChainHops":2,"sameFlavorTransit":true}', 'H2+SFT: прежний конфиг');
+  // (в) сборка уровня вариантов 0–2 даёт конфиг, эквивалентный прежнему
+  // движку: явные флаги равны умолчаниям, которые действовали раньше
+  for (let i = 0; i <= 2; i++) {
+    const v = VARIANTS[i];
+    for (let n = 1; n <= 6; n++) {
+      const exp = buildExperimentLevel(n, { rows: 3, cols: 3 }, v);
+      assertEq(exp.cascade?.directTransferPriority, true, `вариант ${v.name}, уровень ${n}: приоритет прямых — стандартный`);
+      assertEq(exp.cascade?.newPlatePriority, false, `вариант ${v.name}, уровень ${n}: приоритет новой тарелки выключен`);
+    }
+  }
+  // (г) полные партии: явные флаги-умолчания ≡ отсутствию флагов
+  // (журналы ходов совпадают в точности) — поведение движка не изменилось
+  for (let n = 1; n <= 10; n++) {
+    for (const sft of [false, true]) {
+      const levelA = buildLevel(n);
+      const levelB = buildLevel(n);
+      levelA.cascade = { ...levelA.cascade, maxChainHops: 2, sameFlavorTransit: sft, directTransferPriority: true, newPlatePriority: false };
+      levelB.cascade = { ...levelB.cascade, maxChainHops: 2, sameFlavorTransit: sft };
+      const a = createInitialState(levelA);
+      const b = createInitialState(levelB);
+      for (let m = 0; m < 10; m++) {
+        const mva = bestMove(a);
+        const mvb = bestMove(b);
+        if (!mva || !mvb) break;
+        applyTrayMove(a, mva);
+        applyTrayMove(b, mvb);
+        const la = resolveTurnLogged(a, mva.cells);
+        const lb = resolveTurnLogged(b, mvb.cells);
+        assertEq(JSON.stringify(la), JSON.stringify(lb), `уровень ${n}, sft=${sft}, ход ${m}: журналы расходятся`);
+        topUpTray(levelA, a);
+        topUpTray(levelB, b);
+        if (evalEnd(a).phase !== 'playing') break;
+      }
+      assertEq(fingerprint(a), fingerprint(b), `уровень ${n}, sft=${sft}: итоговые состояния расходятся`);
+    }
+  }
+});
+
+test('12.4 Детерминизм 4-й конфигурации и границы метрик', () => {
+  // план переноса стабилен при повторных вызовах
+  const st = createInitialState(sftExampleLevel());
+  applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
+  const a = planNextTransfer(st, [1], noDpCfg(false));
+  const b = planNextTransfer(st, [1], noDpCfg(false));
+  assertEq(a, b, 'повторный вызов planNextTransfer — тот же перенос');
+  // полная партия повторяется в точности
+  const runs: string[] = [];
+  for (let run = 0; run < 2; run++) {
+    const level = buildLevel(7);
+    level.cascade = { ...level.cascade, maxChainHops: 2, sameFlavorTransit: true, directTransferPriority: false };
+    const s = createInitialState(level);
+    const trace: string[] = [];
+    for (let m = 0; m < 12; m++) {
+      const mv = bestMove(s);
+      if (!mv) break;
+      applyTrayMove(s, mv);
+      resolveTurnLogged(s, mv.cells);
+      trace.push(fingerprint(s));
+      topUpTray(level, s);
+      if (evalEnd(s).phase !== 'playing') break;
+    }
+    runs.push(trace.join('|'));
+  }
+  assertEq(runs[0], runs[1], 'повтор партии с 4-й конфигурацией — та же последовательность состояний');
+  // simulateGame по 4-му варианту: инварианты + цепочки накапливаются
+  // по нескольким уровням (один уровень может не дать топологию цепочки)
+  let chainTurns = 0;
+  for (let n = 1; n <= 6 && chainTurns === 0; n++) {
+    const variant = VARIANTS[3];
+    const level = buildExperimentLevel(n, { rows: 3, cols: 3 }, variant);
+    const g1 = simulateGame(level, variant.name, 'combined', seedAt(1), { maxMoves: 40, impactEvery: 0 }, n);
+    const g2 = simulateGame(level, variant.name, 'combined', seedAt(1), { maxMoves: 40, impactEvery: 0 }, n);
+    assertEq(JSON.stringify({ ...g1, ms: 0 }), JSON.stringify({ ...g2, ms: 0 }), `уровень ${n}: simulateGame 4-й конфигурации детерминирован`);
+    chainTurns += g1.turns.filter((t) => t.chainTransfers > 0).length;
+    assert(g1.turns.every((t) => t.toNewPlate >= 0 && t.fromNewPlate >= 0 && !t.aborted), 'счётчики неотрицательны, аборта быть не должно');
+  }
+  assert(chainTurns > 0, 'в партиях с 4-й конфигурацией есть ходы с цепочками');
+});
+
+test('12.5 Флаг приоритета прямых: включён/выключен, взаимодействие с прочими флагами', () => {
+  // при запрещённых цепочках флаг не имеет значения: прямой проход
+  // выполняется в любом случае (иначе переносов бы не было вовсе)
+  const st = createInitialState(sftExampleLevel());
+  applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
+  const offNoChains = planNextTransfer(st, [1], { ...noDpCfg(false), allowChainTransfers: false });
+  const onNoChains = planNextTransfer(st, [1], { ...noDpCfg(true), allowChainTransfers: false });
+  assertEq(offNoChains, onNoChains, 'цепочки запрещены: флаг приоритета прямых не влияет');
+  assertEq(offNoChains?.path.length, 2, 'при запрещённых цепочках перенос только прямой');
+  // прямой перенос не блокируется выключением приоритета: цепочный проход
+  // находит и маршруты из двух ячеек (простое соседство)
+  const stSimple = createInitialState(lv(1, 2, [[0, 0, [0, 0]]], [{ kind: 'single', slices: [0, 0, 0, 0] }]));
+  applyTrayMove(stSimple, { trayIdx: 0, cells: [1], orientation: null });
+  const t = planNextTransfer(stSimple, [1], noDpCfg(false));
+  assert(t !== null, 'приоритет ВЫКЛ: прямой перенос всё равно находится');
+  assertEq(t, { from: 0, to: 1, flavor: 0, count: 2, path: [0, 1] }, 'соседние тарелки: перенос к более богатой (4>2)');
+  // порядок обработки вкусов не изменился: вкусы по возрастанию id
+  const stFlavors = createInitialState(lv(1, 2, [[0, 0, [0, 0, 2, 2]]], [{ kind: 'single', slices: [0, 2] }]));
+  applyTrayMove(stFlavors, { trayIdx: 0, cells: [1], orientation: null });
+  const f = planNextTransfer(stFlavors, [1], noDpCfg(false));
+  assertEq(f, { from: 1, to: 0, flavor: 0, count: 1, path: [1, 0] }, 'первый перенос — наименьший вкус 0 (порядок сохранён)');
+});
+
+/* -- 13. Приоритет новой тарелки как получателя (ТЗ-дополнение §1–6) --- */
+
+/** Конфиг эксперимента NPP: H2 + флаг приоритета новой тарелки */
+function nppCfg(on: boolean, extra: Partial<CascadeConfig> = {}): CascadeConfig {
+  return { ...DEFAULT_CASCADE_CONFIG, maxChainHops: 2, newPlatePriority: on, ...extra };
+}
+
+test('13.1 Новая тарелка получает приоритет перед подходящей, даже если в ней меньше вкуса', () => {
+  // X (3×шоколад) — P (размещённая, 1×шоколад + ваниль): существующий
+  // алгоритм направил бы кусочек ОТ новой К более богатой; с приоритетом —
+  // НАОБОРОТ: кусочки идут В новую тарелку (§1, §4 п. 1–2)
+  const mk = () => {
+    const st = createInitialState(lv(1, 3, [[0, 0, [0, 0, 0]]], [{ kind: 'single', slices: [0, 1] }]));
+    applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
+    return st;
+  };
+  const on = mk();
+  assertEq(chooseRecipient(on, 0, 1, 0, [1], true), 1, 'прямая проверка: получатель — новая тарелка');
+  assertEq(chooseRecipient(on, 0, 1, 0, [1], false), 0, 'флаг выключен: получатель — более богатая (3>1)');
+  assertEq(
+    planNextTransfer(on, [1], nppCfg(true)),
+    { from: 0, to: 1, flavor: 0, count: 3, path: [0, 1] },
+    'NPP: 3 кусочка идут в новую тарелку',
+  );
+  const off = mk();
+  assertEq(
+    planNextTransfer(off, [1], nppCfg(false)),
+    { from: 1, to: 0, flavor: 0, count: 1, path: [1, 0] },
+    'без NPP: 1 кусочек уходит из новой тарелки к более богатой',
+  );
+  // приоритет действует и когда новая тарелка — не «a», а «b» (симметрия)
+  assertEq(chooseRecipient(on, 1, 0, 0, [1], true), 1, 'симметричный вызов: новая тарелка — второй аргумент');
+});
+
+test('13.2 Новая тарелка не может принять — работает существующий алгоритм', () => {
+  // P размещена ПОЛНОЙ (1×шоколад + 5×филлер): приоритет не применяется,
+  // получатель — более богатая X (3×шоколад), новая тарелка отдаёт (§4 п. 3)
+  const mk = (placed: Flavor[]) => {
+    const st = createInitialState(lv(1, 3, [[0, 0, [0, 0, 0]]], [{ kind: 'single', slices: placed }]));
+    applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
+    return st;
+  };
+  const full = mk([0, 7, 7, 7, 7, 7]);
+  assertEq(
+    planNextTransfer(full, [1], nppCfg(true)),
+    { from: 1, to: 0, flavor: 0, count: 1, path: [1, 0] },
+    'полная новая тарелка: существующий алгоритм выбирает альтернативного получателя',
+  );
+  assertEq(
+    planNextTransfer(full, [1], nppCfg(false)),
+    { from: 1, to: 0, flavor: 0, count: 1, path: [1, 0] },
+    'без NPP — тот же результат (вместимость важнее приоритета)',
+  );
+  // новая полная с БОЛЬШИМ числом вкуса: и приоритет, и существующий
+  // алгоритм называют её получателем, но места нет — переноса не будет
+  const rich = mk([0, 0, 0, 0, 7, 7]);
+  assert(planNextTransfer(rich, [1], nppCfg(true)) === null, 'перенос в полную тарелку невозможен (вместимость, §4 п. 5)');
+  assert(planNextTransfer(rich, [1], nppCfg(false)) === null, 'без NPP — тоже невозможен');
+});
+
+test('13.3 Несколько вкусов: приоритет проверяется отдельно для каждого', () => {
+  // X (3×шок + филлер) — P (размещённая, шок+ваниль) — V (4×ваниль):
+  // с NPP оба вкуса идут В новую тарелку; без NPP оба — ИЗ неё
+  const mk = () => {
+    const st = createInitialState(
+      lv(1, 3, [[0, 0, [0, 0, 0, 9]], [0, 2, [1, 1, 1, 1]]], [{ kind: 'single', slices: [0, 1] }]),
+    );
+    applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
+    return st;
+  };
+  const on = mk();
+  const logOn = resolveTurnLogged(on, [1], nppCfg(true));
+  const trOn = logOn.filter((e): e is Extract<TurnEvent, { kind: 'transfer' }> => e.kind === 'transfer');
+  assertEq(
+    trOn.map((e) => [e.transfer.from, e.transfer.to, e.transfer.flavor, e.transfer.count]),
+    [
+      [0, 1, 0, 3],
+      [2, 1, 1, 1],
+      [1, 2, 1, 2],
+    ],
+    'NPP: шоколад и ваниль сначала идут в новую тарелку (каждый вкус отдельно)',
+  );
+  // третий перенос: новая тарелка заполнилась (6 кусочков) — ваниль
+  // возвращается к V по существующему алгоритму (§4 п. 3 в динамике)
+  const off = mk();
+  const logOff = resolveTurnLogged(off, [1], nppCfg(false));
+  const trOff = logOff.filter((e): e is Extract<TurnEvent, { kind: 'transfer' }> => e.kind === 'transfer');
+  assertEq(
+    trOff.map((e) => [e.transfer.from, e.transfer.to, e.transfer.flavor, e.transfer.count]),
+    [
+      [1, 0, 0, 1],
+      [1, 2, 1, 1],
+    ],
+    'без NPP: оба вкуса покидают новую тарелку (прежнее поведение)',
+  );
+  assert(logOn.every((e) => e.kind !== 'aborted') && logOff.every((e) => e.kind !== 'aborted'), 'без срабатывания лимита');
+});
+
+test('13.4 Вместимость не нарушается: перенос ограничен свободным местом', () => {
+  // P размещена с 5×шоколад (1 место), X держит 2×шоколад: в новую тарелку
+  // уходит ровно 1 кусочек, торт из 6 собирается, ячейка освобождается
+  const st = createInitialState(lv(1, 3, [[0, 0, [0, 0]]], [{ kind: 'single', slices: [0, 0, 0, 0, 0] }]));
+  applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
+  const t = planNextTransfer(st, [1], nppCfg(true));
+  assertEq(t, { from: 0, to: 1, flavor: 0, count: 1, path: [0, 1] }, 'переносится только 1 кусочек (место — 1, у донора — 2)');
+  resolveTurn(st, [1]);
+  assertEq(st.completed, 1, 'торт из 6 кусочков собран');
+  assert(st.board[1] === null, 'ячейка новой тарелки освободилась после сборки');
+  assertEq(st.board[0]?.slices.length, 1, 'у донора остался 1 кусочек (ничего не потерялось)');
+});
+
+test('13.5 Выключенный параметр полностью совпадает с прежней реализацией', () => {
+  // (а) на уровне плана переноса: явный false ≡ отсутствию флага (sftCfg
+  // флага NPP не задаёт — берётся умолчание false)
+  const st = createInitialState(
+    lv(1, 3, [[0, 0, [0, 0, 0]]], [{ kind: 'single', slices: [0, 1] }]),
+  );
+  applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
+  assertEq(
+    planNextTransfer(st, [1], nppCfg(false)),
+    planNextTransfer(st, [1], sftCfg(false)),
+    'явный false ≡ конфиг без флага NPP',
+  );
+  // (б) полные партии: конфиг с явным false ≡ конфигу без флага
+  // (всё прочее — одинаковое, включая дальность цепочки уровня)
+  for (let n = 1; n <= 10; n++) {
+    const levelA = buildLevel(n);
+    const levelB = buildLevel(n);
+    levelA.cascade = { ...levelA.cascade, maxChainHops: 2, newPlatePriority: false };
+    levelB.cascade = { ...levelB.cascade, maxChainHops: 2 };
+    const a = createInitialState(levelA);
+    const b = createInitialState(levelB);
+    for (let m = 0; m < 10; m++) {
+      const mva = bestMove(a);
+      const mvb = bestMove(b);
+      if (!mva || !mvb) break;
+      applyTrayMove(a, mva);
+      applyTrayMove(b, mvb);
+      const la = resolveTurnLogged(a, mva.cells);
+      const lb = resolveTurnLogged(b, mvb.cells);
+      assertEq(JSON.stringify(la), JSON.stringify(lb), `уровень ${n}, ход ${m}: журналы расходятся`);
+      topUpTray(levelA, a);
+      topUpTray(levelB, b);
+      if (evalEnd(a).phase !== 'playing') break;
+    }
+    assertEq(fingerprint(a), fingerprint(b), `уровень ${n}: итоговые состояния расходятся`);
+  }
+});
+
+test('13.6 Пример ТЗ-дополнения §2: шоколад через транзит в новую тарелку, ваниль блокируется', () => {
+  // C (полная: 2×шок + 2×ваниль + филлер) — M (транзит: шок+клубника) —
+  // P (размещённая: шок+ваниль). Шоколад может пройти через M (M содержит
+  // шоколад), ваниль — нет (в M нет ванили). Кусочки направляются в НОВУЮ
+  // тарелку P, а не в другую тарелку с большим количеством вкуса.
+  const mk = () => {
+    const st = createInitialState(
+      lv(
+        1,
+        4,
+        [
+          [0, 0, [0, 0, 1, 1, 9, 9]], // C — полная
+          [0, 1, [0, 2]], // M — транзит (шоколад есть, ванили нет)
+        ],
+        [{ kind: 'single', slices: [0, 1] }], // P — размещаем в ячейку 2
+      ),
+    );
+    applyTrayMove(st, { trayIdx: 0, cells: [2], orientation: null });
+    return st;
+  };
+  const st = mk();
+  // уровень правил: цепочка шоколада C→M→P с приоритетом новой тарелки
+  const choc = planChainFrom(st, 0, 0, [2], 2, true, true);
+  assertEq(choc, { from: 0, to: 2, flavor: 0, count: 2, path: [0, 1, 2] }, 'шоколад: C→M→P, получатель — новая тарелка');
+  // без NPP существующий алгоритм назначил бы получателем полную C —
+  // маршрута нет вовсе (куски остаются на месте)
+  const noNpp = planChainFrom(st, 0, 0, [2], 2, true, false);
+  assert(noNpp === null, 'без NPP: к более богатой C кусочки не идут (она полна) — маршрута нет');
+  // ваниль: в M нет ванили — SFT блокирует маршрут независимо от NPP
+  assert(planChainFrom(st, 0, 1, [2], 2, true, true) === null, 'ваниль: транзит без нужного вкуса закрыт (SFT)');
+  // полный ход: H2 + SFT + NPP + приоритет прямых ВЫКЛ (совместная проверка
+  // правил, включая 4-ю конфигурацию): цепочка выполняется целиком
+  const joint = mk();
+  const logJoint = resolveTurnLogged(joint, [2], nppCfg(true, { sameFlavorTransit: true, directTransferPriority: false }));
+  const trJoint = logJoint.filter((e): e is Extract<TurnEvent, { kind: 'transfer' }> => e.kind === 'transfer');
+  assertEq(
+    trJoint.map((e) => [e.transfer.from, e.transfer.to, e.transfer.flavor, e.transfer.count, e.transfer.path]),
+    [
+      [0, 2, 0, 2, [0, 1, 2]],
+      [1, 2, 0, 1, [1, 2]],
+    ],
+    'совместный ход: цепочка C→M→P (2 кусочка) + прямой M→P (1 кусочек)',
+  );
+  assertEq(joint.board[2]?.slices.map((s) => s.flavor), [0, 1, 0, 0, 0], 'новая тарелка: 4×шоколад + ваниль');
+  assert(trJoint.every((e) => e.transfer.flavor === 0), 'ваниль так и не двинулась (SFT)');
+  // тот же ход при СТАНДАРТНОМ приоритете прямых: прямой M→P вытесняет
+  // цепочку — шоколад M уходит в P, шоколад C остаётся (конфликт из
+  // дополнения к эксперименту H2+SFT воспроизводится и с NPP)
+  const direct = mk();
+  const logDirect = resolveTurnLogged(direct, [2], nppCfg(true, { sameFlavorTransit: true }));
+  const trDirect = logDirect.filter((e): e is Extract<TurnEvent, { kind: 'transfer' }> => e.kind === 'transfer');
+  assertEq(
+    trDirect.map((e) => [e.transfer.from, e.transfer.to, e.transfer.path]),
+    [[1, 2, [1, 2]]],
+    'приоритет прямых ВКЛ: только прямой перенос M→P, цепочка вытеснена',
+  );
+  assertEq(direct.board[0]?.slices.filter((s) => s.flavor === 0).length, 2, 'шоколад C остался на месте — маршрут разрушен');
+});
+
+test('13.7 Цепочка с приоритетом новой тарелки против более богатого получателя', () => {
+  // 2×3: D (полная, 4×шок) — T и T2 (транзиты с шоколадом) — P (размещённая,
+  // 1×шок) и X (5×шок, 1 место). Оба получателя на глубине 2. С NPP кусочки
+  // идут в НОВУЮ тарелку (4 шт.), без NPP — в более богатую X (1 шт.).
+  const mk = () => {
+    const st = createInitialState(
+      lv(
+        2,
+        3,
+        [
+          [0, 0, [0, 0, 0, 0, 9, 9]], // D (ячейка 0): полная, 4×шоколад
+          [0, 1, [0, 7]], // T (ячейка 1): транзит
+          [1, 0, [0, 8]], // T2 (ячейка 3): транзит
+          [1, 1, [0, 0, 0, 0, 0]], // X (ячейка 4): 5×шоколад, 1 место
+        ],
+        [{ kind: 'single', slices: [0, 1] }], // P — размещаем в ячейку 2
+      ),
+    );
+    applyTrayMove(st, { trayIdx: 0, cells: [2], orientation: null });
+    return st;
+  };
+  const on = mk();
+  assertEq(
+    planChainFrom(on, 0, 0, [2], 2, true, true),
+    { from: 0, to: 2, flavor: 0, count: 4, path: [0, 1, 2] },
+    'NPP: 4 кусочка идут цепочкой в новую тарелку (не в X с 5×шоколад)',
+  );
+  const off = mk();
+  assertEq(
+    planChainFrom(off, 0, 0, [2], 2, true, false),
+    { from: 0, to: 4, flavor: 0, count: 1, path: [0, 1, 4] },
+    'без NPP: 1 кусочек идёт в более богатую X (существующий алгоритм)',
+  );
+});
+
+test('13.8 Порядок обработки вкусов не изменился (приоритет — попутно)', () => {
+  // пара с двумя общими вкусами: первым обрабатывается меньший id,
+  // приоритет новой тарелки не меняет порядок (§6: «не менять остальные
+  // правила механики попутно»)
+  const st = createInitialState(lv(1, 2, [[0, 0, [0, 0, 2, 2]]], [{ kind: 'single', slices: [0, 2] }]));
+  applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
+  const log = resolveTurnLogged(st, [1], nppCfg(true));
+  const tr = log.filter((e): e is Extract<TurnEvent, { kind: 'transfer' }> => e.kind === 'transfer');
+  assertEq(tr.map((e) => e.transfer.flavor), [0, 2], 'вкусы обрабатываются по возрастанию id (0, затем 2)');
+  assertEq(tr.map((e) => e.transfer.to), [1, 1], 'оба переноса — в новую тарелку (приоритет по каждому вкусу)');
+  assertEq(st.board[1]?.slices.length, 6, 'новая тарелка заполнена ровно до вместимости');
+  assert(st.board[0] === null, 'донор опустел и покинул поле');
+});
+
+test('13.9 Полные партии с NPP: целостность, активация правила, детерминизм', () => {
+  // ВАЖНО (находка проверок перед симуляциями): приоритет новой тарелки
+  // в текущей спецификации НЕ гарантирует завершимости разрешения хода —
+  // доказательство аудита §2.4 опиралось на монотонность «к богатому»,
+  // которую NPP нарушает. Осцилляция воспроизведена и зафиксирована в
+  // 13.11; здесь гарантируется ЦЕЛОСТНОСТЬ даже при срабатывании защитного
+  // лимита (кусочки не теряются, тарелки валидны, партия продолжается).
+  for (const sft of [false, true]) {
+    let toNewPlate = 0;
+    let total = 0;
+    let abortedTurns = 0;
+    for (let n = 1; n <= 10; n++) {
+      const level = buildLevel(n);
+      level.cascade = { ...level.cascade, maxChainHops: 2, sameFlavorTransit: sft, newPlatePriority: true };
+      const st = createInitialState(level);
+      const initialSlices = level.initial.reduce((s, p) => s + p.slices.length, 0);
+      let placedSlices = 0;
+      for (let m = 0; m < 40; m++) {
+        const mv = bestMove(st);
+        if (!mv) break;
+        placedSlices += traySize(st.tray[mv.trayIdx]);
+        applyTrayMove(st, mv);
+        const log = resolveTurnLogged(st, mv.cells);
+        if (log.some((e) => e.kind === 'aborted')) abortedTurns++;
+        for (const e of log) {
+          if (e.kind !== 'transfer') continue;
+          total++;
+          if (mv.cells.includes(e.transfer.to)) toNewPlate++;
+          assert(e.transfer.path.length <= 3, `sft=${sft}, уровень ${n}, ход ${m}: маршрут длиннее H2`);
+        }
+        for (const p of st.board) {
+          if (p) assert(p.slices.length >= 1 && p.slices.length <= CAP, `sft=${sft}, уровень ${n}, ход ${m}: битая тарелка`);
+        }
+        // кусочки не теряются ДАЖЕ при аборте: разрешение обрывается,
+        // но состояние остаётся консистентным (аудит §6.2)
+        const onBoard = st.board.reduce((s, p) => s + (p ? p.slices.length : 0), 0);
+        assertEq(initialSlices + placedSlices, onBoard + CAP * st.completed, `sft=${sft}, уровень ${n}, ход ${m}: кусочки не теряются`);
+        topUpTray(level, st);
+        if (evalEnd(st).phase !== 'playing') break;
+      }
+    }
+    assert(total > 0, `sft=${sft}: переносы происходят`);
+    assert(toNewPlate > 0, `sft=${sft}: правило активно — есть переносы в новую тарелку`);
+    // аборты возможны (13.11), но обязаны быть редкими и детерминированными;
+    // честная частота измеряется симуляциями и попадает в отчёт
+    assert(abortedTurns < 40, `sft=${sft}: аборты не должны происходить каждый ход (${abortedTurns})`);
+  }
+  // детерминизм: партия с NPP+SFT повторяется в точности
+  const runs: string[] = [];
+  for (let run = 0; run < 2; run++) {
+    const level = buildLevel(7);
+    level.cascade = { ...level.cascade, maxChainHops: 2, sameFlavorTransit: true, newPlatePriority: true };
+    const st = createInitialState(level);
+    const trace: string[] = [];
+    for (let m = 0; m < 12; m++) {
+      const mv = bestMove(st);
+      if (!mv) break;
+      applyTrayMove(st, mv);
+      resolveTurnLogged(st, mv.cells);
+      trace.push(fingerprint(st));
+      topUpTray(level, st);
+      if (evalEnd(st).phase !== 'playing') break;
+    }
+    runs.push(trace.join('|'));
+  }
+  assertEq(runs[0], runs[1], 'повтор партии с NPP+SFT — та же последовательность состояний');
+});
+
+test('13.10 Метрики симулятора: переносы в новую тарелку считаются', () => {
+  const opts = { maxMoves: 40, impactEvery: 0 };
+  let withNppToNew = 0;
+  let withoutNppToNew = 0;
+  for (let n = 1; n <= 4; n++) {
+    for (const v of [VARIANTS[1], VARIANTS[4]]) {
+      const level = buildExperimentLevel(n, { rows: 3, cols: 3 }, v);
+      const g = simulateGame(level, v.name, 'immediate', seedAt(0), opts, n);
+      const toNew = g.turns.reduce((a, t) => a + t.toNewPlate, 0);
+      if (v.name === 'H2+NPP') withNppToNew += toNew;
+      else withoutNppToNew += toNew;
+      assert(g.turns.every((t) => t.toNewPlate <= t.transfers && t.fromNewPlate <= t.transfers), 'счётчики не превышают переносов');
+    }
+  }
+  assert(withNppToNew > 0, 'H2+NPP: переносы в новую тарелку есть');
+  assert(withNppToNew > withoutNppToNew, `NPP повышает долю переносов в новую тарелку (${withNppToNew} > ${withoutNppToNew})`);
+});
+
+test('13.11 Осцилляция NPP: защитный лимит срабатывает, состояние консистентно', () => {
+  // Минимальная топология осцилляции (найдена на уровне 8, см. отчёт):
+  // X (3×вкуса-4 + 2×филлера, 1 место) и размещённая P (2×вкуса-4 + 4×филлера,
+  // полная). Пока у P есть место, NPP тянет кусочек из X; когда P полна,
+  // существующий алгоритм (X богаче: 3>2) возвращает кусочек из P в X —
+  // и цикл повторяется бесконечно. Правила в этой ситуации предписывают
+  // именно такие переносы (§1 приоритет + §4 п. 3 fallback), поэтому
+  // завершимость разрешения хода при NPP не гарантируется — это свойство
+  // спецификации, а не ошибка реализации. Движок обрывает цикл защитным
+  // лимитом maxResolutionSteps (аудит §6.2) и остаётся консистентным.
+  const st = createInitialState(
+    lv(
+      1,
+      2,
+      [[0, 0, [4, 4, 4, 8, 8]]], // X (ячейка 0): 3×вкуса 4, 1 место
+      [{ kind: 'single', slices: [4, 4, 0, 0, 0, 0] }], // P — размещаем в ячейку 1 (полная)
+    ),
+  );
+  applyTrayMove(st, { trayIdx: 0, cells: [1], orientation: null });
+  const log = resolveTurnLogged(st, [1], nppCfg(true));
+  const ab = log.find((e): e is Extract<TurnEvent, { kind: 'aborted' }> => e.kind === 'aborted');
+  assert(ab !== undefined, 'осцилляция обязана привести к срабатыванию защитного лимита');
+  assertEq(ab!.steps, 64, 'лимит — 64 шага (умолчание)');
+  assertEq(ab!.limit, 64, 'в событии — предельное значение');
+  const tr = log.filter((e): e is Extract<TurnEvent, { kind: 'transfer' }> => e.kind === 'transfer');
+  assertEq(tr.length, 64, 'до аборта выполняется 64 переноса');
+  // перенос — тот же кусочек туда-обратно: P→X, X→P, P→X…
+  assertEq(
+    tr.slice(0, 6).map((e) => [e.transfer.from, e.transfer.to, e.transfer.flavor, e.transfer.count]),
+    [
+      [1, 0, 4, 1],
+      [0, 1, 4, 1],
+      [1, 0, 4, 1],
+      [0, 1, 4, 1],
+      [1, 0, 4, 1],
+      [0, 1, 4, 1],
+    ],
+    'кусочник осциллирует между новой тарелкой и более богатым соседом',
+  );
+  // состояние после аборта консистентно: 11 кусочков на месте, тортов нет
+  const onBoard = st.board.reduce((s, p) => s + (p ? p.slices.length : 0), 0);
+  assertEq(onBoard, 11, 'куски не теряются при аборте');
+  assertEq(st.completed, 0, 'торт не собирается');
+  for (const p of st.board) {
+    if (p) assert(p.slices.length >= 1 && p.slices.length <= CAP, 'тарелки валидны после аборта');
+  }
+  // без NPP та же позиция спокойна: перенос один, дальше тупик (X полон)
+  const st2 = createInitialState(
+    lv(1, 2, [[0, 0, [4, 4, 4, 8, 8]]], [{ kind: 'single', slices: [4, 4, 0, 0, 0, 0] }]),
+  );
+  applyTrayMove(st2, { trayIdx: 0, cells: [1], orientation: null });
+  const log2 = resolveTurnLogged(st2, [1], nppCfg(false));
+  assert(log2.every((e) => e.kind !== 'aborted'), 'без NPP осцилляции нет');
+  assertEq(log2.filter((e) => e.kind === 'transfer').length, 1, 'без NPP — один перенос (P→X) и стоп');
 });
 
 /* ------------------------------ Итог -------------------------------- */

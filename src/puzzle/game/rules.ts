@@ -125,6 +125,15 @@ function freeSpace(p: GPlate): number {
  * 2) при равенстве — тарелка, размещённая в текущем ходе (для двойной
  *    размещённых может быть две — тогда побеждает меньший индекс ячейки);
  * 3) иначе минимальный индекс ячейки.
+ *
+ * Эксперимент «Приоритет новой тарелки» (ТЗ-дополнение §1): при
+ * newPlatePriority = true тарелка, размещённая в текущем ходу, получает
+ * приоритет получателя ПЕРЕД шагом 1 — независимо от числа кусочков
+ * этого вкуса в ней. Ограничение вместимости остаётся в силе (§4 п. 5):
+ * если новая тарелка заполнена и не может принять кусочек, приоритет
+ * не применяется и получатель выбирается существующим алгоритмом
+ * (§4 п. 3). При newPlatePriority = false поведение не отличается от
+ * прежней реализации (§4 п. 6). Экспортирована для тестов уровня правил.
  */
 export function chooseRecipient(
   state: GState,
@@ -132,10 +141,22 @@ export function chooseRecipient(
   b: CellIndex,
   flavor: Flavor,
   lastPlaced: readonly CellIndex[] | null,
+  newPlatePriority: boolean = false,
 ): CellIndex {
   const pa = state.board[a];
   const pb = state.board[b];
   if (!pa || !pb) throw new Error('chooseRecipient: both cells must hold plates');
+  if (newPlatePriority && lastPlaced && lastPlaced.length > 0) {
+    const aNew = lastPlaced.includes(a);
+    const bNew = lastPlaced.includes(b);
+    if (aNew !== bNew) {
+      // ровно одна из двух — размещённая в этом ходу: она получает
+      // приоритет, если может принять кусочек (вместимость не нарушается);
+      // полная новая тарелка приоритета не даёт — далее существующий алгоритм
+      const newPlate = aNew ? pa : pb;
+      if (freeSpace(newPlate) > 0) return aNew ? a : b;
+    }
+  }
   const ca = flavorCount(pa, flavor);
   const cb = flavorCount(pb, flavor);
   if (ca > cb) return a;
@@ -176,6 +197,12 @@ export function chooseRecipient(
  * по-прежнему необходимо: правило добавляет требование вкуса, а не
  * заменяет правило вместимости. Прямые переносы (маршруты без транзитов)
  * правилом не затрагиваются. Экспортирована для тестов уровня правил.
+ *
+ * Эксперимент «Приоритет новой тарелки» (ТЗ-дополнение §1–2):
+ * newPlatePriority передаётся в chooseRecipient — если старт или
+ * найденный кандидат является тарелкой, размещённой в текущем ходу,
+ * она становится получателем (при наличии места). Алгоритм выбора
+ * получателя, порядок обхода и правила вместимости не меняются (§6).
  */
 export function planChainFrom(
   state: GState,
@@ -184,6 +211,7 @@ export function planChainFrom(
   lastPlaced: readonly CellIndex[] | null,
   maxHops: number = Infinity,
   sameFlavorTransit: boolean = false,
+  newPlatePriority: boolean = false,
 ): Transfer | null {
   const { cols, rows, board } = state;
   const startPlate = board[start];
@@ -210,7 +238,7 @@ export function planChainFrom(
         if (c === start) break;
       }
       path.reverse(); // [start, …транзиты…, cell]
-      const recipient = chooseRecipient(state, start, cell, flavor, lastPlaced);
+      const recipient = chooseRecipient(state, start, cell, flavor, lastPlaced, newPlatePriority);
       if (recipient === start) {
         // start — получатель: донор cell, маршрут разворачивается
         const count = Math.min(freeSpace(startPlate), flavorCount(plate, flavor));
@@ -262,6 +290,16 @@ function cascadeOf(state: GState, cfg?: CascadeConfig): CascadeConfig {
  * (maxChainHops: 1 — только прямые, 2 — один транзит) и приоритет
  * прямых переносов (directTransferPriority). Умолчание воспроизводит
  * поведение до Этапа B.
+ *
+ * Эксперимент «H2 + SFT + Direct Transfer Priority OFF» (nextStep,
+ * дополнение к эксперименту): при directTransferPriority = false отдельный
+ * проход прямых переносов не выполняется — прямые пары находит и цепочный
+ * проход (маршруты из двух ячеек), но цепочки больше не вытесняются
+ * прямыми переносами. Алгоритм выбора получателя, порядок обработки
+ * вкусов и остальные правила разрешения хода не меняются (§Ограничения).
+ *
+ * Эксперимент «Приоритет новой тарелки» (ТЗ-дополнение §1): флаг
+ * newPlatePriority передаётся в chooseRecipient обоих проходов.
  */
 export function planNextTransfer(
   state: GState,
@@ -283,7 +321,7 @@ export function planNextTransfer(
         const q = board[nb];
         if (!q) continue;
         for (const f of sharedFlavors(p, q)) {
-          const recipient = chooseRecipient(state, cell, nb, f, lastPlaced);
+          const recipient = chooseRecipient(state, cell, nb, f, lastPlaced, config.newPlatePriority);
           const donorCell = recipient === cell ? nb : cell;
           const donor = board[donorCell];
           const recv = board[recipient];
@@ -303,7 +341,7 @@ export function planNextTransfer(
     const p = board[cell];
     if (!p) continue;
     for (const f of distinctFlavors(p)) {
-      const chain = planChainFrom(state, cell, f, lastPlaced, config.maxChainHops, config.sameFlavorTransit);
+      const chain = planChainFrom(state, cell, f, lastPlaced, config.maxChainHops, config.sameFlavorTransit, config.newPlatePriority);
       if (chain) return chain;
     }
   }
